@@ -1,0 +1,61 @@
+{
+  "model": "facebook/nllb-200-distilled-1.3B",
+  "source_revision": "7be3e24664b38ce1cac29b8aeed6911aa0cf0576",
+  "source_model_sha256": "7e40f838a5aad3d60e9254632ab876bda44340386ca7ebad3e099db7432b04e1",
+  "conversion": {
+    "ctranslate2": "4.8.2",
+    "transformers": "4.57.6",
+    "quantization": "int8_float16"
+  },
+  "license": "cc-by-nc-4.0",
+  "weights": [
+    {
+      "file": "config.json",
+      "bytes": 233,
+      "sha256": "72901fbd8abd89fb5cf4a388f26fc681f5c4c58a1e1a88b30b879f107270e7ee"
+    },
+    {
+      "file": "model.bin",
+      "bytes": 1377755777,
+      "sha256": "9da7fd1c9064bcd06f6505de454abadffff3c41958be9e456d4cd3fae4894cf9"
+    },
+    {
+      "file": "README.md",
+      "bytes": 7653,
+      "sha256": "fd1dc9f45b7a6709662a7c972f6ab82bdbc1bc0d742257c08ad80b497ba620cc"
+    },
+    {
+      "file": "shared_vocabulary.json",
+      "bytes": 6177383,
+      "sha256": "768aa4170693765cb4c62fc485ea4fd954cd3e5a44bc645d11d83f41f2393776"
+    }
+  ],
+  "tokenizer": [
+    {
+      "file": "README.md",
+      "bytes": 7653,
+      "sha256": "fd1dc9f45b7a6709662a7c972f6ab82bdbc1bc0d742257c08ad80b497ba620cc"
+    },
+    {
+      "file": "sentencepiece.bpe.model",
+      "bytes": 4852054,
+      "sha256": "14bb8dfb35c0ffdea7bc01e56cea38b9e3d5efcdcb9c251d6b40538e1aab555a"
+    },
+    {
+      "file": "special_tokens_map.json",
+      "bytes": 4487,
+      "sha256": "27d4e8cb8b9a7c0f8234273dfefa64568f859c796f058037b4228948b84cd5fc"
+    },
+    {
+      "file": "tokenizer.json",
+      "bytes": 32240136,
+      "sha256": "1ddfe2edc28eca006306d9edc066dd9a5c0ad8cf00e9124f0e8642f743c86c0a"
+    },
+    {
+      "file": "tokenizer_config.json",
+      "bytes": 41770,
+      "sha256": "0cd0b9564b7bac60e015521b5e81dd5f7a1739c2c28d68993aaa20d0e6896085"
+    }
+  ],
+  "tokenizer_preparation": "AutoTokenizer 4.57.6 local_files_only, legacy_behaviour=False, zho_Hans prefix; source raw tokenizer retained"
+}

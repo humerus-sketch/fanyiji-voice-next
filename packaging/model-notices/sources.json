@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "collected_at": "2026-10-17T17:41:23.312265+08:00",
+  "files": [
+    {
+      "file": "GTCRN-MIT-LICENSE.txt",
+      "source_url": "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/main/LICENSE",
+      "size": 1069,
+      "sha256": "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794",
+      "acquisition": "official source download, original bytes"
+    },
+    {
+      "file": "Hy-MT2-Apache-2.0-LICENSE.txt",
+      "source_url": "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/LICENSE.txt",
+      "size": 11639,
+      "sha256": "a1d52d448f81c584a47c583e19dfab2d3851c7c84431b07baee093c1113ed114",
+      "acquisition": "official source download, original bytes"
+    },
+    {
+      "file": "M2M100-MIT-LICENSE.txt",
+      "source_url": "https://huggingface.co/facebook/m2m100_418M/blob/55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636/LICENSE",
+      "size": 1086,
+      "sha256": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "NLLB-CC-BY-NC-4.0-LICENSE.txt",
+      "source_url": "https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt",
+      "size": 19347,
+      "sha256": "41003d4a74749c0220e33dd415042164b5a1093ed401f36277234f772d22d3d0",
+      "acquisition": "official source download, original bytes"
+    },
+    {
+      "file": "NLLB-conversion-provenance.json",
+      "source_url": "https://huggingface.co/facebook/nllb-200-distilled-1.3B/tree/7be3e24664b38ce1cac29b8aeed6911aa0cf0576",
+      "size": 1966,
+      "sha256": "c184f77749515b7573b8a6d6e6fcc20d8d988126c5109a3db77b5e831fd375d8",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "SenseVoice-FunASR-MODEL-LICENSE.txt",
+      "source_url": "https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE",
+      "size": 5306,
+      "sha256": "7dba975a2069691db4992b0592d70828b330d2f8a30a71450f4e152a554e84f8",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "SenseVoice-LICENSE-reference.txt",
+      "source_url": "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/blob/2365baeacb507f821a0c8120fcee3d484dba7a07/LICENSE",
+      "size": 71,
+      "sha256": "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "Silero-VAD-MIT-LICENSE.txt",
+      "source_url": "https://github.com/snakers4/silero-vad/blob/master/LICENSE",
+      "size": 1075,
+      "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "UVR-historical-2022-MIT-LICENSE.txt",
+      "source_url": "https://raw.githubusercontent.com/Anjok07/ultimatevocalremovergui/0fd6b751dbbe9da9c96660d0b4ec2b07108727b7/LICENSE",
+      "size": 1072,
+      "sha256": "33337ea3a00d1fbec48b4569db8c0da4b2d1d4b6de3acdd01ca8e011b0ec41ff",
+      "acquisition": "official source download, original bytes"
+    },
+    {
+      "file": "Whisper-MIT-LICENSE.txt",
+      "source_url": "https://raw.githubusercontent.com/openai/whisper/main/LICENSE",
+      "size": 1063,
+      "sha256": "b5d65a59060e68c4ff940e1eddfa6f94b2d68fdf58ed7f4dd57721c997e35e9d",
+      "acquisition": "official source download, original bytes"
+    },
+    {
+      "file": "Whisper-conversion-provenance.json",
+      "source_url": "https://huggingface.co/Systran/faster-whisper-large-v3/tree/edaa852ec7e145841d8ffdb056a99866b5f0a478",
+      "size": 1216,
+      "sha256": "22de871933c454443eb7421a2beb4b8fdf3e69b54b434d1f684a33c0fb6064d9",
+      "acquisition": "unchanged copy of the existing model notice or conversion record"
+    },
+    {
+      "file": "llama-cpp-b11696-MIT-LICENSE.txt",
+      "source_url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b11696/LICENSE",
+      "size": 1078,
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "acquisition": "official source download, original bytes"
+    }
+  ],
+  "download_failures": [],
+  "mdx_model_in_public_package": false
+}
