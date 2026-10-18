@@ -71,7 +71,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m venv "$env:CI_RELEASE_ROOT/venv"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:CI_RELEASE_ROOT/venv/Scripts/python.exe" -m pip install --disable-pip-version-check --no-cache-dir --retries 3 --timeout 60 -r "$env:CI_RELEASE_ROOT/source/requirements-ab-lock.txt" --report "$env:CI_RELEASE_ROOT/pip-install-report.json"
+          & "$env:CI_RELEASE_ROOT/venv/Scripts/python.exe" -m pip install --disable-pip-version-check --no-cache-dir --no-compile --retries 3 --timeout 60 -r "$env:CI_RELEASE_ROOT/source/requirements-ab-lock.txt" --report "$env:CI_RELEASE_ROOT/pip-install-report.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$env:CI_RELEASE_ROOT/venv/Scripts/python.exe" -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -44,11 +44,21 @@ def test_build_environment_excludes_unrelated_dll_and_python_paths(monkeypatch, 
     monkeypatch.setenv("PATH", "C:/unrelated/poppler/bin;C:/unrelated/libheif/bin")
     monkeypatch.setenv("PYTHONPATH", "C:/unrelated/application")
     monkeypatch.setenv("PYTHONHOME", "C:/unrelated/python")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     environment = builder.build_environment()
     assert "unrelated" not in environment["PATH"]
     assert "PYTHONPATH" not in environment and "PYTHONHOME" not in environment
     assert "System32" in environment["PATH"]
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert "unrelated" in os.environ["PATH"]
+
+
+def test_ci_install_and_all_build_steps_disable_bytecode_generation(builder):
+    workflow = (builder.ROOT / ".github/workflows/build-release.yml").read_text(encoding="utf-8")
+    assert "PYTHONDONTWRITEBYTECODE: '1'" in workflow
+    installations = [line for line in workflow.splitlines() if " -m pip install " in line]
+    assert len(installations) == 1
+    assert " --no-compile " in installations[0]
 
 
 def test_prototype_uses_its_own_entrypoint_and_excludes_voice_modules(builder, tmp_path, monkeypatch):
