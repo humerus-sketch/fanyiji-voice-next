@@ -810,3 +810,105 @@ def test_runtime_rejects_recursive_bootstrap_and_applies_ready_marker_last(monke
     with pytest.raises(update.UpdateError,match="bootstrap"):
         update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
     assert not list(downloaded.archive_path.parent.glob("prepare/install-*/job.json"))
+
+
+def metadata_runtime(monkeypatch, tmp_path, *, stable=False):
+    ready=json.dumps({"schema_version":1,"application":update.APPLICATION,"version":VERSION,"build_id":"voice-ab-test-r1"}).encode()
+    files={"FanyiJiVoiceNext.exe":b"new executable","_updater/runtime-ready.json":ready,
+           "_internal/fanyiji_qa_metadata-2.0.dist-info/METADATA":b"Metadata-Version: 2.1\nName: FanyiJi-QA.Metadata\nVersion: 2.0\n\nnew metadata",
+           "_internal/fanyiji_qa_metadata-2.0.dist-info/WHEEL":b"new wheel"}
+    package=archive(tmp_path,files)
+    descriptor,bodies=runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch,bodies)
+    downloaded=update.download_runtime_bundle(descriptor,tmp_path/"download",repository=REPOSITORY)
+    install=installation(tmp_path)
+    old=install/"_internal/fanyiji_qa_metadata-1.0.dist-info"
+    (old/"licenses").mkdir(parents=True)
+    (old/"METADATA").write_bytes(b"Metadata-Version: 2.1\nName: fanyiji_qa_metadata\nVersion: 1.0\n\nold metadata")
+    (old/"licenses/LICENSE").write_bytes(b"old license retained")
+    unrelated=install/"_internal/unrelated-1.0.dist-info"
+    unrelated.mkdir()
+    (unrelated/"METADATA").write_bytes(b"Name: Other-Package\nVersion: 1.0\n")
+    if stable:
+        prepared=client(tmp_path).prepare(package,install)
+    else:
+        prepared=update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
+    monkeypatch.syspath_prepend(str(install/"_internal"))
+    return prepared,old,unrelated
+
+
+def test_runtime_retires_only_matching_old_metadata_and_real_metadata_api_sees_new_version(monkeypatch,tmp_path):
+    from importlib.metadata import version
+    prepared,old,unrelated=metadata_runtime(monkeypatch,tmp_path)
+    assert version("fanyiji-qa-metadata")=="1.0"
+    ready=prepared.install_dir/"_updater/runtime-ready.json"
+    original=update._atomic_copy
+    def copy(source,target):
+        if target==ready:
+            assert not old.exists()
+            assert version("fanyiji-qa-metadata")=="2.0"
+        original(source,target)
+    monkeypatch.setattr(update,"_atomic_copy",copy)
+    backup=update.apply_update(prepared.job_path,restart=False)
+    assert version("fanyiji-qa-metadata")=="2.0"
+    assert (backup/"_internal"/old.name/"METADATA").read_bytes().endswith(b"old metadata")
+    assert (backup/"_internal"/old.name/"licenses/LICENSE").read_bytes()==b"old license retained"
+    assert (unrelated/"METADATA").read_bytes()==b"Name: Other-Package\nVersion: 1.0\n"
+    assert (prepared.install_dir/"models/model.gguf").read_bytes()==b"user model"
+    assert (prepared.install_dir/"settings/voice.settings.json").read_bytes()==b"user settings"
+
+
+@pytest.mark.parametrize("partial_cleanup",[False,True])
+def test_runtime_metadata_removal_failure_restores_old_metadata_and_program(monkeypatch,tmp_path,partial_cleanup):
+    from importlib.metadata import version
+    prepared,old,_=metadata_runtime(monkeypatch,tmp_path)
+    original=update._atomic_copy
+    if partial_cleanup:
+        remove=update._remove_metadata_tree
+        def fail_remove(folder,install,snapshot):
+            if folder!=old:
+                return remove(folder,install,snapshot)
+            (folder/"METADATA").unlink()
+            raise OSError("injected partial removal failure")
+        monkeypatch.setattr(update,"_remove_metadata_tree",fail_remove)
+    else:
+        def fail_ready(source,target):
+            if target.name=="runtime-ready.json": raise OSError("injected failure after metadata retirement")
+            original(source,target)
+        monkeypatch.setattr(update,"_atomic_copy",fail_ready)
+    with pytest.raises(update.UpdateError,match="安装失败"):
+        update.apply_update(prepared.job_path,restart=False)
+    assert (prepared.install_dir/"FanyiJiVoiceNext.exe").read_bytes()==b"old executable"
+    assert version("fanyiji-qa-metadata")=="1.0"
+    assert (old/"licenses/LICENSE").read_bytes()==b"old license retained"
+    assert (old/"METADATA").read_bytes().endswith(b"old metadata")
+    assert not (prepared.install_dir/"_internal/fanyiji_qa_metadata-2.0.dist-info").exists()
+
+
+@pytest.mark.parametrize("bad",["missing-metadata","duplicate-name","hardlink","symlink"])
+def test_runtime_metadata_rejects_abnormal_or_linked_old_tree_before_program_changes(monkeypatch,tmp_path,bad):
+    prepared,old,_=metadata_runtime(monkeypatch,tmp_path)
+    outside=prepared.install_dir/"models/model.gguf"
+    if bad=="missing-metadata":
+        (old/"METADATA").rename(old/"METADATA.missing")
+    elif bad=="duplicate-name":
+        (old/"METADATA").write_bytes(b"Name: a\nName: b\nVersion: 1.0\n")
+    elif bad=="hardlink":
+        os.link(outside,old/"linked.txt")
+    else:
+        try:
+            (old/"linked.txt").symlink_to(outside)
+        except OSError as error:
+            pytest.skip(f"OS does not permit test symlinks: {error}")
+    with pytest.raises(update.UpdateError):
+        update.apply_update(prepared.job_path,restart=False)
+    assert (prepared.install_dir/"FanyiJiVoiceNext.exe").read_bytes()==b"old executable"
+    assert outside.read_bytes()==b"user model"
+    assert not (prepared.cache_dir/"backup").exists()
+
+
+def test_stable_jobs_do_not_retire_metadata_even_if_archive_has_ready_marker(monkeypatch,tmp_path):
+    prepared,old,_=metadata_runtime(monkeypatch,tmp_path,stable=True)
+    assert "runtime_build_id" not in json.loads(prepared.job_path.read_text(encoding="utf-8"))
+    update.apply_update(prepared.job_path,restart=False)
+    assert old.is_dir()

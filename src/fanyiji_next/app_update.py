@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import contextmanager
+from email.parser import BytesHeaderParser
 import hashlib
 from http.client import HTTPException
 import json
@@ -339,7 +340,7 @@ class UpdateClient:
             raise UpdateError(f"下载更新失败：{exc}") from exc
 
     def prepare(self, downloaded: DownloadedUpdate, install_dir: Path, executable: str = "FanyiJiVoiceNext.exe", *,
-                _stage_check=None) -> PreparedUpdate:
+                _stage_check=None, _runtime_build_id=None) -> PreparedUpdate:
         if executable != "FanyiJiVoiceNext.exe":
             raise UpdateError("更新目标不是翻译姬语音版程序")
         _reject_link_tree(Path(install_dir))
@@ -363,6 +364,8 @@ class UpdateClient:
         payload = {"schema_version": 1, "application": APPLICATION, "version": downloaded.info.version,
                    "install_dir": str(install), "stage_dir": str(stage), "backup_dir": str(job_dir / "backup"),
                    "executable": executable, "pid": 0, "restart_args": []}
+        if _runtime_build_id is not None:
+            payload["runtime_build_id"] = _runtime_build_id
         job = job_dir / "job.json"
         job.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return PreparedUpdate(job, install, downloaded.info.version)
@@ -600,16 +603,21 @@ def prepare_runtime_bundle(downloaded: DownloadedRuntimeBundle, install_dir: Pat
     info = UpdateInfo(spec.version, spec.name, spec.parts[0].url, spec.sha256, spec.size,
                       f"https://github.com/{repository}/releases/tag/v{spec.version}")
     return UpdateClient(repository, Path(cache_dir) if cache_dir else Path(downloaded.archive_path).parent / "prepare").prepare(
-        DownloadedUpdate(info, downloaded.archive_path), install_dir, _stage_check=lambda stage: _verify_runtime_ready(stage, spec))
+        DownloadedUpdate(info, downloaded.archive_path), install_dir, _stage_check=lambda stage: _verify_runtime_ready(stage, spec),
+        _runtime_build_id=spec.build_id)
 
 
 def _verify_runtime_ready(stage: Path, spec: RuntimeBundleDescriptor):
+    _check_runtime_ready(stage, spec.version, spec.build_id)
+
+
+def _check_runtime_ready(stage: Path, version: str, build_id: str):
     ready = stage / "_updater" / "runtime-ready.json"
     if not ready.is_file() or ready.stat().st_size > MAX_JSON_BYTES:
         raise UpdateError("完整运行库缺少 runtime-ready.json")
     value = _object(_json(ready.read_bytes()), {"schema_version", "application", "version", "build_id"}, "运行库完成标识")
     if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["application"] != APPLICATION
-            or value["version"] != spec.version or value["build_id"] != spec.build_id):
+            or value["version"] != version or value["build_id"] != build_id):
         raise UpdateError("运行库完成标识与下载描述不匹配")
     if (stage / "_updater" / "runtime-bootstrap.json").exists():
         raise UpdateError("完整运行库不得包含 bootstrap 描述")
@@ -770,7 +778,11 @@ def _load_job(job_path: Path):
     data = job_path.read_bytes()
     if len(data) > MAX_JSON_BYTES:
         raise UpdateError("安装任务超过限制")
-    job = _object(_json(data), {"schema_version", "application", "version", "install_dir", "stage_dir", "backup_dir", "executable", "pid", "restart_args"}, "安装任务")
+    value = _json(data)
+    fields = {"schema_version", "application", "version", "install_dir", "stage_dir", "backup_dir", "executable", "pid", "restart_args"}
+    if isinstance(value, dict) and "runtime_build_id" in value:
+        fields.add("runtime_build_id")
+    job = _object(value, fields, "安装任务")
     if type(job["schema_version"]) is not int or job["schema_version"] != 1 or job["application"] != APPLICATION or job["executable"] != "FanyiJiVoiceNext.exe":
         raise UpdateError("安装任务产品或格式无效")
     _version_key(job["version"])
@@ -789,6 +801,11 @@ def _load_job(job_path: Path):
     if not (install / job["executable"]).is_file():
         raise UpdateError("安装目标 EXE 已不存在")
     rows = _manifest((stage / ARCHIVE_MANIFEST).read_bytes(), job["version"])
+    if "runtime_build_id" in job:
+        build_id = job["runtime_build_id"]
+        if not isinstance(build_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", build_id):
+            raise UpdateError("运行库安装任务 build_id 无效")
+        _check_runtime_ready(stage, job["version"], build_id)
     for row in rows:
         source = _inside(stage / row["path"], stage)
         target = _inside(install / row["path"], install)
@@ -925,6 +942,126 @@ def _installation_lock(install_dir: Path):
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def _metadata_name(folder: Path) -> str:
+    _metadata_entry(folder, directory=True)
+    path = folder / "METADATA"
+    _metadata_entry(path, directory=False)
+    if path.stat().st_size > MAX_JSON_BYTES:
+        raise UpdateError("程序分发包 METADATA 超过限制")
+    headers = BytesHeaderParser().parsebytes(path.read_bytes())
+    names = headers.get_all("Name", [])
+    if len(names) != 1 or not re.fullmatch(r"(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])", names[0]):
+        raise UpdateError("程序分发包 METADATA 缺少唯一有效的 Name")
+    return re.sub(r"[-_.]+", "-", names[0]).casefold()
+
+
+def _metadata_entry(path: Path, *, directory: bool):
+    _reject_link_tree(path)
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise UpdateError("程序分发包 metadata 路径无效") from error
+    if (getattr(info, "st_file_attributes", 0) & 0x400 or stat.S_ISLNK(info.st_mode)
+            or (not stat.S_ISDIR(info.st_mode) if directory else not stat.S_ISREG(info.st_mode) or info.st_nlink != 1)):
+        raise UpdateError("程序分发包 metadata 必须是无链接的普通目录与文件")
+
+
+def _metadata_snapshot(folder: Path) -> dict:
+    """Small program metadata only; never traverse model or settings directories."""
+    files, directories, pending, total = {}, [], [folder], 0
+    while pending:
+        current = pending.pop()
+        _metadata_entry(current, directory=True)
+        relative = current.relative_to(folder).as_posix()
+        directories.append(relative)
+        for path in current.iterdir():
+            relative = path.relative_to(folder).as_posix()
+            _safe_path(f"_internal/{folder.name}/{relative}", directory=path.is_dir())
+            if path.is_dir():
+                _metadata_entry(path, directory=True)
+                pending.append(path)
+            else:
+                _metadata_entry(path, directory=False)
+                total += path.stat().st_size
+                if len(files) >= 10000 or total > 128 * 1024 * 1024:
+                    raise UpdateError("程序分发包 metadata 超过备份限制")
+                files[relative] = {"size": path.stat().st_size, "sha256": _digest(path)}
+    return {"files": files, "directories": sorted(directories)}
+
+
+def _runtime_metadata_plan(stage: Path, install: Path, rows: list[dict]):
+    names, targets = {}, []
+    for row in rows:
+        path = PurePosixPath(row["path"])
+        if len(path.parts) == 3 and path.parts[0] == "_internal" and path.parts[1].casefold().endswith(".dist-info") and path.name == "METADATA":
+            folder = stage / "_internal" / path.parts[1]
+            name = _metadata_name(folder)
+            if name in names:
+                raise UpdateError("完整运行库含同名的重复分发包 metadata")
+            names[name] = path.parts[1]
+            target = _inside(install / "_internal" / path.parts[1], install)
+            if not target.exists():
+                targets.append(target)
+    internal = install / "_internal"
+    _metadata_entry(internal, directory=True)
+    retired = []
+    for folder in internal.iterdir():
+        if not folder.name.casefold().endswith(".dist-info"):
+            continue
+        name = _metadata_name(folder)
+        if name in names and folder.name.casefold() != names[name].casefold():
+            _inside(folder, internal)
+            retired.append((folder, _metadata_snapshot(folder)))
+    return retired, targets
+
+
+def _copy_metadata_tree(source: Path, target: Path, snapshot: dict):
+    if _metadata_snapshot(source) != snapshot:
+        raise UpdateError("旧程序 metadata 在备份或恢复期间发生变化")
+    _reject_link_tree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    for relative in snapshot["directories"]:
+        destination = target if relative == "." else _inside(target / relative, target)
+        _reject_link_tree(destination)
+        destination.mkdir(exist_ok=True)
+    for relative in snapshot["files"]:
+        original, destination = _inside(source / relative, source), _inside(target / relative, target)
+        _metadata_entry(original, directory=False)
+        if destination.exists():
+            _metadata_entry(destination, directory=False)
+        shutil.copy2(original, destination, follow_symlinks=False)
+    if _metadata_snapshot(target) != snapshot:
+        raise UpdateError("程序 metadata 备份或恢复校验失败")
+
+
+def _remove_metadata_tree(folder: Path, install: Path, snapshot: dict):
+    # Every destructive action is constrained to one verified immediate
+    # _internal/*.dist-info directory. No recursive tree deletion is used.
+    internal = _inside(install / "_internal", install)
+    target = _inside(folder, internal)
+    if target.parent != internal or not target.name.casefold().endswith(".dist-info"):
+        raise UpdateError("旧程序 metadata 清理范围无效")
+    if _metadata_snapshot(target) != snapshot:
+        raise UpdateError("旧程序 metadata 在移除前发生变化")
+    for relative in snapshot["files"]:
+        path = _inside(target / relative, internal)
+        _metadata_entry(path, directory=False)
+        path.unlink()
+    for relative in sorted(snapshot["directories"], key=lambda value: len(PurePosixPath(value).parts), reverse=True):
+        path = target if relative == "." else _inside(target / relative, internal)
+        _metadata_entry(path, directory=True)
+        path.rmdir()
+
+
+def _remove_new_empty_metadata(folder: Path, install: Path):
+    if not folder.exists():
+        return
+    snapshot = _metadata_snapshot(folder)
+    if snapshot["files"]:
+        raise UpdateError("回滚后的新增 metadata 目录仍含文件；未删除")
+    _remove_metadata_tree(folder, install, snapshot)
+
+
 def apply_update(job_path: Path, *, wait_timeout: float = 120, pid_alive=None, restart: bool = True, start=None):
     job, _ = _load_job(Path(job_path))
     with _installation_lock(Path(job["install_dir"])):
@@ -946,15 +1083,26 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
     # Recheck staged hashes and every existing target after the finite wait.
     job, rows = _load_job(job_path)
     stage, install, backup = (Path(job[key]) for key in ("stage_dir", "install_dir", "backup_dir"))
+    retired, new_metadata = _runtime_metadata_plan(stage, install, rows) if "runtime_build_id" in job else ([], [])
     if backup.exists():
         raise UpdateError("此安装任务已创建备份，不重复应用；请保留日志和备份")
     backup.mkdir()
     touched = []
+    metadata_backups = []
+    metadata_cleanup_started = False
     try:
+        for folder, snapshot in retired:
+            previous = _inside(backup / "_internal" / folder.name, backup)
+            _copy_metadata_tree(folder, previous, snapshot)
+            metadata_backups.append((folder, previous, snapshot))
         # A bootstrap becomes runnable only after every program file has been
         # replaced successfully. Keep the readiness marker last in the transaction.
         for row in sorted(rows, key=lambda row: row["path"].casefold() == "_updater/runtime-ready.json"):
             relative = row["path"]
+            if relative.casefold() == "_updater/runtime-ready.json" and retired:
+                metadata_cleanup_started = True
+                for folder, _, snapshot in metadata_backups:
+                    _remove_metadata_tree(folder, install, snapshot)
             target = _inside(install / relative, install)
             previous = _inside(backup / relative, backup)
             existed = target.exists()
@@ -978,6 +1126,17 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
                     target.unlink()
             except Exception as rollback_exc:
                 rollback_errors.append(f"{relative}: {rollback_exc}")
+        for folder in new_metadata:
+            try:
+                _remove_new_empty_metadata(folder, install)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{folder.name}: {rollback_exc}")
+        if metadata_cleanup_started:
+            for folder, previous, snapshot in metadata_backups:
+                try:
+                    _copy_metadata_tree(previous, folder, snapshot)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{folder.name}: {rollback_exc}")
         suffix = "；回滚失败：" + "; ".join(rollback_errors) if rollback_errors else "；已恢复原程序文件"
         raise UpdateError(f"安装失败：{exc}{suffix}。备份保留在 {backup}") from exc
     return backup
