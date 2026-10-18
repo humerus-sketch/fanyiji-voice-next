@@ -1,0 +1,107 @@
+name: Build model-free Windows release (draft only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 'Full 40-character source commit; empty uses this workflow commit'
+        type: string
+        default: ''
+      staging_tag:
+        description: 'NEW staging draft tag; never the stable v0.5.3 tag'
+        type: string
+        default: 'v0.5.3-r3-build'
+      final_assets_tag:
+        description: 'Final asset URL tag (descriptor must match application version)'
+        type: string
+        default: 'v0.5.3'
+      upload_draft:
+        description: 'Create an independent draft and upload verified public assets; never publish'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: model-free-release-${{ inputs.staging_tag }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      QT_QPA_PLATFORM: offscreen
+      PYINSTALLER_CONFIG_DIR: ${{ runner.temp }}/fanyiji-pyinstaller-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
+      CI_STAGING_TAG: ${{ inputs.staging_tag }}
+      CI_FINAL_ASSETS_TAG: ${{ inputs.final_assets_tag }}
+    steps:
+      - name: Checkout the requested immutable source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Python
+        id: python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.13'
+          architecture: x64
+      - name: Check real disk space and create this run's isolated workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          $work = Join-Path $env:RUNNER_TEMP "fanyiji-release-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "CI_RELEASE_ROOT=$work" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python tools/ci_release.py prepare --work-root "$work" --commit "$env:CI_SOURCE_COMMIT" --staging-tag "$env:CI_STAGING_TAG" --final-tag "$env:CI_FINAL_ASSETS_TAG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install only the pinned A/B dependency lock (no project voice extras)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m venv "$env:CI_RELEASE_ROOT/venv"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:CI_RELEASE_ROOT/venv/Scripts/python.exe" -m pip install --disable-pip-version-check --no-cache-dir --retries 3 --timeout 60 -r "$env:CI_RELEASE_ROOT/source/requirements-ab-lock.txt" --report "$env:CI_RELEASE_ROOT/pip-install-report.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:CI_RELEASE_ROOT/venv/Scripts/python.exe" -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Download and verify the pinned official llama runtime
+        shell: pwsh
+        run: python tools/ci_release.py llama --work-root "$env:CI_RELEASE_ROOT"
+      - name: Run source tests, build both executables, check frozen runtime and UI
+        shell: pwsh
+        run: python tools/ci_release.py build --work-root "$env:CI_RELEASE_ROOT"
+      - name: Package zero model weights, raw parts, bootstrap and old-client feed
+        shell: pwsh
+        run: python tools/ci_release.py package --work-root "$env:CI_RELEASE_ROOT"
+      - name: Create a NEW independent draft and verify every uploaded asset
+        if: ${{ inputs.upload_draft }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/ci_release.py upload-draft --work-root "$env:CI_RELEASE_ROOT"
+      - name: Retain small public build reports (no program duplicate, models or recordings)
+        if: ${{ always() && env.CI_RELEASE_ROOT != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CI_RELEASE_ROOT }}/state.json
+            ${{ env.CI_RELEASE_ROOT }}/disk-*.json
+            ${{ env.CI_RELEASE_ROOT }}/frozen/checks/runtime.json
+            ${{ env.CI_RELEASE_ROOT }}/frozen/checks/ui.json
+            ${{ env.CI_RELEASE_ROOT }}/frozen/checks/ui.png
+            ${{ env.CI_RELEASE_ROOT }}/release/*.json
+            ${{ env.CI_RELEASE_ROOT }}/release/*.txt
+            ${{ env.CI_RELEASE_ROOT }}/release/*.md
+          if-no-files-found: warn
+          retention-days: 3
