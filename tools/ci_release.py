@@ -118,7 +118,7 @@ def prepare(root, commit, staging_tag, final_tag):
     root.mkdir()
     value = {"schema_version": 1, "owned_root": str(root.resolve()), "run_id": os.environ["GITHUB_RUN_ID"],
              "source_commit": commit, "version": version, "staging_tag": staging_tag, "final_tag": final_tag,
-             "build_id": f"voice-ab-{version}-20261019-r2", "model_weights_bundled": False,
+             "build_id": f"voice-ab-{version}-20261019-r3", "model_weights_bundled": False,
              "python_version": sys.version.split()[0], "python_version_manifest": PYTHON_MANIFEST,
              "python_patch_selection": "3.12.13 has no Windows x64 Actions asset; use official 3.12.10 Windows x64",
              "public_download_or_install_verified": False}

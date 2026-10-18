@@ -20,6 +20,75 @@ def forbidden(*_args, **_kwargs):
     raise AssertionError("Audio capture, model loading or settings access was unexpected")
 
 
+def test_cleanup_ack_waits_for_visible_frozen_gui_and_never_loads_models(monkeypatch, tmp_path):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QWidget
+    from fanyiji_next import update_cleanup
+
+    qt_app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    window.show()
+    contexts = [(tmp_path / "cleanup-receipt.json", "a" * 64)]
+    calls = []
+    executable = tmp_path / "FanyiJiVoiceNext.exe"
+    monkeypatch.setattr(application.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(application.sys, "executable", str(executable))
+    monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
+    monkeypatch.setattr(audio_runtime.VoiceRuntime, "start", forbidden)
+    monkeypatch.setattr(settings, "load_settings", forbidden)
+    monkeypatch.setattr(settings, "save_settings", forbidden)
+    monkeypatch.setattr(update_cleanup, "acknowledge_and_cleanup",
+                        lambda value, **kwargs: calls.append((value, kwargs)) or [{"status": "complete"}])
+    application._schedule_update_cleanup(window, contexts)
+    assert not calls
+    assert window._update_cleanup_timer.interval() == 3000
+    assert window._update_cleanup_timer.isSingleShot()
+    # Exercise the actual queued callback without waiting three wall seconds.
+    window._update_cleanup_timer.start(1)
+    QTest.qWait(20)
+    window._update_cleanup_worker.join(1)
+    assert calls == [(contexts, {"executable": executable, "version": application.__version__})]
+    assert window._update_cleanup_result == [{"status": "complete"}]
+    window.close()
+    window.deleteLater()
+    qt_app.processEvents()
+
+
+def test_closed_gui_does_not_ack_startup(monkeypatch, tmp_path):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QWidget
+    from fanyiji_next import update_cleanup
+
+    qt_app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    monkeypatch.setattr(application.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update_cleanup, "acknowledge_and_cleanup", forbidden)
+    application._schedule_update_cleanup(window, [(tmp_path / "receipt.json", "a" * 64)])
+    window._update_cleanup_timer.start(1)
+    QTest.qWait(20)
+    assert not hasattr(window, "_update_cleanup_worker")
+    window.deleteLater()
+    qt_app.processEvents()
+
+
+def test_source_gui_and_non_gui_verification_never_ack_cleanup(monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QWidget
+    from fanyiji_next import update_cleanup
+
+    qt_app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    monkeypatch.setattr(application.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(update_cleanup, "acknowledge_and_cleanup", forbidden)
+    contexts = [(tmp_path / "receipt.json", "a" * 64)]
+    application._schedule_update_cleanup(window, contexts)
+    assert not hasattr(window, "_update_cleanup_timer")
+    monkeypatch.setattr(application, "check_runtime", lambda path: 0)
+    assert application.main(["--check-runtime", "--update-receipt", str(contexts[0][0]),
+                             "--update-token", contexts[0][1]]) == 0
+    window.deleteLater()
+    qt_app.processEvents()
+
+
 def assert_ab_profile(window, combination="A", *, root=None):
     """Normal startup exposes only the selected pair under the main-file root."""
     value = window.settings

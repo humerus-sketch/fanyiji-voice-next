@@ -268,8 +268,48 @@ def smoke_test(screenshot=None, report_path=None):
     return 0 if result["ok"] else 2
 
 
+def _schedule_update_cleanup(window, contexts):
+    """Confirm a normal GUI startup before discarding this update's rollback files."""
+    if not getattr(sys, "frozen", False):
+        return
+    pending = Path(sys.executable).absolute().parent / "_updater/update-cleanup-pending.json"
+    if not contexts and not pending.is_file():
+        return
+    from PySide6.QtCore import QTimer, Qt
+    import threading
+
+    timer = QTimer(window)
+    timer.setSingleShot(True)
+    timer.setTimerType(Qt.TimerType.PreciseTimer)
+    window._update_cleanup_timer = timer
+
+    def confirm():
+        if not window.isVisible():
+            return
+
+        def cleanup():
+            from .update_cleanup import acknowledge_and_cleanup
+            # The cleaner validates the running EXE and the ready marker. It
+            # never imports an engine, reads model weights, or starts capture.
+            try:
+                window._update_cleanup_result = acknowledge_and_cleanup(
+                    contexts, executable=Path(sys.executable), version=__version__)
+            except Exception as exc:
+                window._update_cleanup_result = {"status": "pending", "error": str(exc)}
+
+        worker = threading.Thread(target=cleanup, name="update-cleanup", daemon=True)
+        window._update_cleanup_worker = worker
+        worker.start()
+
+    timer.timeout.connect(confirm)
+    timer.start(3000)
+
+
 def main(argv=None):
     from .verification import BACKEND_OPTIONS, BACKEND_PATH_OPTIONS, add_backend_arguments
+    from .update_cleanup import split_cleanup_args
+
+    clean_argv, cleanup_contexts = split_cleanup_args(sys.argv[1:] if argv is None else argv)
 
     parser = argparse.ArgumentParser(description="翻译姬 · 语音版 NEXT，本地中日语音字幕")
     modes = parser.add_mutually_exclusive_group()
@@ -286,7 +326,7 @@ def main(argv=None):
     # Omitted options preserve a GUI user's existing settings. The verifier has
     # its own isolated SenseVoice/M2M100 CPU profile and never reads that file.
     add_backend_arguments(parser, defaults=False)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(clean_argv)
     if args.check_runtime:
         return check_runtime(args.report)
     if args.smoke_test:
@@ -380,7 +420,7 @@ def main(argv=None):
     settings = with_model_combination(settings, selected_model_combination(settings), external_model_root())
     window = StudioWindow(settings, prototype=False)
     # Preserve explicit profile/model selections when the updater restarts this EXE.
-    window._update_restart_args = tuple(sys.argv[1:] if argv is None else argv)
+    window._update_restart_args = tuple(clean_argv)
     window.set_settings_source(str(target.resolve()))
     controller = AppController(window, settings_file=target)
     window._controller = controller
@@ -412,6 +452,7 @@ def main(argv=None):
     if error:
         window.show_error(error)
     window.show()
+    _schedule_update_cleanup(window, cleanup_contexts)
     return app.exec()
 
 

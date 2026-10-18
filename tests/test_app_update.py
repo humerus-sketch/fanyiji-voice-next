@@ -912,3 +912,186 @@ def test_stable_jobs_do_not_retire_metadata_even_if_archive_has_ready_marker(mon
     assert "runtime_build_id" not in json.loads(prepared.job_path.read_text(encoding="utf-8"))
     update.apply_update(prepared.job_path,restart=False)
     assert old.is_dir()
+
+
+def cleanup_prepared_update(monkeypatch, tmp_path):
+    package = archive(tmp_path)
+    instance = client(tmp_path)
+    monkeypatch.setattr(instance, "_open", lambda url: Response(package.archive_path.read_bytes()))
+    downloaded = instance.download(package.info)
+    prepared = instance.prepare(downloaded, installation(tmp_path))
+    return downloaded, prepared
+
+
+def test_prepare_records_only_owned_downloads_without_extending_stable_job(monkeypatch, tmp_path):
+    downloaded, prepared = cleanup_prepared_update(monkeypatch, tmp_path)
+    job = json.loads(prepared.job_path.read_text(encoding="utf-8"))
+    assert set(job) == {"schema_version", "application", "version", "install_dir", "stage_dir", "backup_dir",
+                        "executable", "pid", "restart_args"}
+    assert (prepared.cache_dir / "cleanup-downloads.json").is_file()
+    assert downloaded.archive_path.is_file()
+    update._load_job(prepared.job_path)
+
+
+def test_frozen_install_retains_backup_until_matching_startup_ack(monkeypatch, tmp_path):
+    from fanyiji_next import update_cleanup as cleanup
+    downloaded, prepared = cleanup_prepared_update(monkeypatch, tmp_path)
+    job = json.loads(prepared.job_path.read_text(encoding="utf-8"))
+    inherited = ["--update-receipt", "previous-receipt.json", "--update-token", "previous-token", "--reader"]
+    job["restart_args"] = inherited
+    prepared.job_path.write_text(json.dumps(job), encoding="utf-8")
+    started = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: started.append(command))
+    backup = update.apply_update(prepared.job_path)
+    command = started[0]
+    assert command[1:1 + len(inherited)] == inherited
+    clean, contexts = cleanup.split_cleanup_args(command[1 + len(inherited):])
+    assert clean == [] and len(contexts) == 1
+    assert backup.is_dir() and (prepared.cache_dir / "staged").is_dir()
+    assert downloaded.archive_path.is_file()
+    cleanup.acknowledge_and_cleanup(contexts, prepared.install_dir / "FanyiJiVoiceNext.exe", VERSION)
+    assert not backup.exists() and not (prepared.cache_dir / "staged").exists()
+    assert not downloaded.archive_path.exists()
+    assert (prepared.install_dir / "FanyiJiVoiceNext.exe").read_bytes() == b"new executable"
+    assert (prepared.install_dir / "models/model.gguf").read_bytes() == b"user model"
+    assert (prepared.install_dir / "settings/voice.settings.json").read_bytes() == b"user settings"
+    assert (prepared.install_dir / "custom.txt").read_bytes() == b"user text"
+
+
+def test_restart_failure_rolls_back_and_receipt_cannot_clean_old_program(monkeypatch, tmp_path):
+    from fanyiji_next import update_cleanup as cleanup
+    downloaded, prepared = cleanup_prepared_update(monkeypatch, tmp_path)
+    commands = []
+    def fail_restart(command, **kwargs):
+        commands.append(command)
+        raise OSError("simulated launch failure")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update.subprocess, "Popen", fail_restart)
+    with pytest.raises(update.UpdateError, match="已恢复原程序"):
+        update.apply_update(prepared.job_path)
+    _, contexts = cleanup.split_cleanup_args(commands[0][1:])
+    cleanup.acknowledge_and_cleanup(contexts, prepared.install_dir / "FanyiJiVoiceNext.exe", VERSION)
+    assert (prepared.install_dir / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+    assert (prepared.cache_dir / "backup/FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+    assert (prepared.cache_dir / "staged").is_dir() and downloaded.archive_path.is_file()
+    assert (prepared.install_dir / "models/model.gguf").read_bytes() == b"user model"
+
+
+@pytest.mark.parametrize("mismatch", ["version", "executable-path", "executable-sha"])
+def test_startup_ack_cannot_clean_transaction_for_wrong_application(monkeypatch, tmp_path, mismatch):
+    from fanyiji_next import update_cleanup as cleanup
+    downloaded, prepared = cleanup_prepared_update(monkeypatch, tmp_path)
+    commands = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: commands.append(command))
+    backup = update.apply_update(prepared.job_path)
+    _, contexts = cleanup.split_cleanup_args(commands[0][1:])
+    executable, version = prepared.install_dir / "FanyiJiVoiceNext.exe", VERSION
+    if mismatch == "version":
+        version = "0.5.1"
+    elif mismatch == "executable-path":
+        executable = tmp_path / "other-install" / "FanyiJiVoiceNext.exe"
+        executable.parent.mkdir()
+        executable.write_bytes(b"new executable")
+    else:
+        executable.write_bytes(b"unexpected executable contents")
+    cleanup.acknowledge_and_cleanup(contexts, executable, version)
+    assert backup.is_dir() and (prepared.cache_dir / "staged").is_dir()
+    assert downloaded.archive_path.is_file()
+    assert (prepared.install_dir / "models/model.gguf").read_bytes() == b"user model"
+    assert (prepared.install_dir / "settings/voice.settings.json").read_bytes() == b"user settings"
+
+
+def test_runtime_owned_download_cleanup_handles_default_nested_prepare_cache(monkeypatch, tmp_path):
+    from fanyiji_next import update_cleanup as cleanup
+    files = {"FanyiJiVoiceNext.exe": b"new runtime executable",
+             "_updater/runtime-ready.json": json.dumps({"schema_version": 1, "application": update.APPLICATION,
+                                                          "version": VERSION, "build_id": "voice-ab-test-r1"}).encode()}
+    package = archive(tmp_path, files)
+    descriptor, bodies = runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch, bodies)
+    downloaded = update.download_runtime_bundle(descriptor, tmp_path / "downloads", repository=REPOSITORY)
+    prepared = update.prepare_runtime_bundle(downloaded, installation(tmp_path), repository=REPOSITORY)
+    assert prepared.cache_dir.is_relative_to(downloaded.archive_path.parent)
+    commands = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: commands.append(command))
+    backup = update.apply_update(prepared.job_path)
+    _, contexts = cleanup.split_cleanup_args(commands[0][1:])
+    cleanup.acknowledge_and_cleanup(contexts, prepared.install_dir / "FanyiJiVoiceNext.exe", VERSION)
+    assert not backup.exists() and not (prepared.cache_dir / "staged").exists()
+    assert not downloaded.archive_path.exists()
+    assert not list(downloaded.archive_path.parent.glob("*.part"))
+    assert not list(downloaded.archive_path.parent.glob("part-*"))
+    assert (prepared.install_dir / "models/model.gguf").read_bytes() == b"user model"
+    assert (prepared.install_dir / "settings/voice.settings.json").read_bytes() == b"user settings"
+
+
+def test_runtime_custom_prepare_cache_remains_valid_and_does_not_claim_downloads(monkeypatch, tmp_path):
+    from fanyiji_next import update_cleanup as cleanup
+    files = {"FanyiJiVoiceNext.exe": b"new runtime executable",
+             "_updater/runtime-ready.json": json.dumps({"schema_version": 1, "application": update.APPLICATION,
+                                                          "version": VERSION, "build_id": "voice-ab-test-r1"}).encode()}
+    package = archive(tmp_path, files)
+    descriptor, bodies = runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch, bodies)
+    downloaded = update.download_runtime_bundle(descriptor, tmp_path / "downloads", repository=REPOSITORY)
+    prepared = update.prepare_runtime_bundle(downloaded, installation(tmp_path),
+                                             cache_dir=tmp_path / "independent-prepare", repository=REPOSITORY)
+    assert prepared.cache_dir.parent == tmp_path / "independent-prepare"
+    assert not (prepared.cache_dir / "cleanup-downloads.json").exists()
+    commands = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: commands.append(command))
+    backup = update.apply_update(prepared.job_path)
+    _, contexts = cleanup.split_cleanup_args(commands[0][1:])
+    cleanup.acknowledge_and_cleanup(contexts, prepared.install_dir / "FanyiJiVoiceNext.exe", VERSION)
+    assert not backup.exists() and not (prepared.cache_dir / "staged").exists()
+    assert downloaded.archive_path.is_file()
+    assert list(downloaded.archive_path.parent.glob("part-*.verified"))
+    assert (prepared.install_dir / "models/model.gguf").read_bytes() == b"user model"
+    assert (prepared.install_dir / "settings/voice.settings.json").read_bytes() == b"user settings"
+
+
+@pytest.mark.parametrize("mode", ["source", "no-restart", "injected-start"])
+def test_source_or_nonreal_restart_does_not_create_cleanup_receipt(monkeypatch, tmp_path, mode):
+    from fanyiji_next import update_cleanup as cleanup
+    _, prepared = cleanup_prepared_update(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "frozen", mode != "source", raising=False)
+    monkeypatch.setattr(cleanup, "create_startup_receipt", lambda job: pytest.fail("must retain manual/test transactions"))
+    commands = []
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: commands.append(command))
+    backup = update.apply_update(prepared.job_path, restart=mode != "no-restart",
+                                 start=(lambda command, **kwargs: commands.append(command)) if mode == "injected-start" else None)
+    assert backup.is_dir() and (prepared.cache_dir / "staged").is_dir()
+    assert not commands or commands[0] == [str(prepared.install_dir / "FanyiJiVoiceNext.exe")]
+
+
+def test_helper_failure_notice_has_three_second_timeout_and_no_blocking_fallback(monkeypatch):
+    class Notify:
+        def __call__(self, *args):
+            self.args = args
+            return 32000
+    notification = Notify()
+    class User32:
+        MessageBoxTimeoutW = notification
+    monkeypatch.setattr(update.ctypes, "WinDLL", lambda *args, **kwargs: User32())
+    update._show_failure_notice("test failure")
+    assert notification.args[-1] == 3000
+    assert notification.args[1] == "test failure"
+    monkeypatch.setattr(update.ctypes, "WinDLL", lambda *args, **kwargs: object())
+    update._show_failure_notice("API absent; durable log remains")
+
+
+def test_helper_failure_logs_before_bounded_notice_and_returns_failure(monkeypatch, tmp_path):
+    job = tmp_path / "job.json"
+    job.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(update, "apply_update", lambda *args: (_ for _ in ()).throw(update.UpdateError("fixture failure")))
+    notices = []
+    def notice(message):
+        assert "fixture failure" in (tmp_path / "update.log").read_text(encoding="utf-8")
+        notices.append(message)
+    monkeypatch.setattr(update, "_show_failure_notice", notice)
+    assert update.helper_main(["--job", str(job)]) == 1
+    assert len(notices) == 1

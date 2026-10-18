@@ -1,7 +1,7 @@
 """Explicit, program-only GitHub Release updates; no audio or model imports.
 
 The separate frozen helper is copied to the update cache before the application
-exits. It never deletes an installation tree and retains its transaction backup.
+exits. Transaction backups remain until the new application acknowledges startup.
 """
 from __future__ import annotations
 
@@ -340,7 +340,7 @@ class UpdateClient:
             raise UpdateError(f"下载更新失败：{exc}") from exc
 
     def prepare(self, downloaded: DownloadedUpdate, install_dir: Path, executable: str = "FanyiJiVoiceNext.exe", *,
-                _stage_check=None, _runtime_build_id=None) -> PreparedUpdate:
+                _stage_check=None, _runtime_build_id=None, _cleanup_cache_root=None) -> PreparedUpdate:
         if executable != "FanyiJiVoiceNext.exe":
             raise UpdateError("更新目标不是翻译姬语音版程序")
         _reject_link_tree(Path(install_dir))
@@ -368,6 +368,8 @@ class UpdateClient:
             payload["runtime_build_id"] = _runtime_build_id
         job = job_dir / "job.json"
         job.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        from fanyiji_next.update_cleanup import record_download_cleanup
+        record_download_cleanup(job, archive, cache if _cleanup_cache_root is None else Path(_cleanup_cache_root))
         return PreparedUpdate(job, install, downloaded.info.version)
 
 
@@ -604,7 +606,7 @@ def prepare_runtime_bundle(downloaded: DownloadedRuntimeBundle, install_dir: Pat
                       f"https://github.com/{repository}/releases/tag/v{spec.version}")
     return UpdateClient(repository, Path(cache_dir) if cache_dir else Path(downloaded.archive_path).parent / "prepare").prepare(
         DownloadedUpdate(info, downloaded.archive_path), install_dir, _stage_check=lambda stage: _verify_runtime_ready(stage, spec),
-        _runtime_build_id=spec.build_id)
+        _runtime_build_id=spec.build_id, _cleanup_cache_root=Path(downloaded.archive_path).parent.parent)
 
 
 def _verify_runtime_ready(stage: Path, spec: RuntimeBundleDescriptor):
@@ -1113,6 +1115,12 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
             _atomic_copy(stage / relative, target)
         if restart:
             command = [str(install / job["executable"]), *job["restart_args"]]
+            # Only the real frozen helper can schedule cleanup. Source utilities
+            # and injected test launchers retain their transaction for inspection.
+            if start is None and bool(getattr(sys, "frozen", False)):
+                from fanyiji_next.update_cleanup import create_startup_receipt
+                receipt, token = create_startup_receipt(job_path)
+                command.extend(["--update-receipt", str(receipt), "--update-token", token])
             (start or subprocess.Popen)(command, cwd=str(install), close_fds=True, env=_fresh_process_environment(),
                                        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
     except Exception as exc:
@@ -1142,6 +1150,21 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
     return backup
 
 
+def _show_failure_notice(message: str):
+    """A helper failure must never wait indefinitely for a modal confirmation."""
+    if os.name != "nt":
+        return
+    try:
+        notify = ctypes.WinDLL("user32", use_last_error=True).MessageBoxTimeoutW
+        notify.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                           ctypes.c_uint, ctypes.c_ushort, ctypes.c_uint]
+        notify.restype = ctypes.c_int
+        notify(None, message, "翻译姬 · 更新失败", 0x10, 0, 3000)
+    except (AttributeError, OSError):
+        # The durable update.log remains available on systems without this API.
+        pass
+
+
 def helper_main(argv=None) -> int:
     import argparse
 
@@ -1161,6 +1184,5 @@ def helper_main(argv=None) -> int:
             log_path.write_text(message + "\n", encoding="utf-8")
         except OSError:
             pass
-        if os.name == "nt":
-            ctypes.windll.user32.MessageBoxW(None, message, "翻译姬 · 更新失败", 0x10)
+        _show_failure_notice(message)
         return 1
