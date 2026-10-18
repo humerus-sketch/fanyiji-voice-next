@@ -53,6 +53,59 @@ def test_partial_settings_get_defaults_for_missing_fields(tmp_path):
     assert settings.mdx_model_file == settings.gtcrn_model_file == ""
 
 
+@pytest.mark.parametrize("opacity", [85, 100])
+def test_old_profile_keeps_opacity_when_transparency_flag_is_missing(tmp_path, opacity):
+    target = tmp_path / "settings.json"
+    target.write_text(json.dumps({"schema_version": 1, "window_opacity": opacity}), encoding="utf-8")
+    before = target.read_bytes()
+    settings = load_settings(target)
+    assert settings.window_transparency_enabled is True
+    assert settings.window_opacity == opacity
+    assert target.read_bytes() == before
+
+
+def test_disabling_transparency_preserves_strength_after_restart(tmp_path):
+    target = tmp_path / "settings.json"
+    settings = AppSettings(window_transparency_enabled=False, window_opacity=55)
+    save_settings(settings, target)
+    restored = load_settings(target)
+    assert restored.window_transparency_enabled is False
+    assert restored.window_opacity == 55
+    save_settings(replace(restored, window_transparency_enabled=True), target)
+    assert load_settings(target).window_opacity == 55
+
+
+@pytest.mark.parametrize("opacity", [30, 100])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_transparency_opacity_boundaries_roundtrip(tmp_path, opacity, enabled):
+    target = tmp_path / "settings.json"
+    settings = AppSettings(window_opacity=opacity, window_transparency_enabled=enabled)
+    save_settings(settings, target)
+    assert load_settings(target) == settings
+
+
+@pytest.mark.parametrize("value", [29, 101, True, False, 30.0, 100.0])
+def test_invalid_opacity_is_rejected_when_saving_and_loading(tmp_path, value):
+    target = tmp_path / "settings.json"
+    with pytest.raises(SettingsError, match="window_opacity"):
+        save_settings(replace(AppSettings(), window_opacity=value), target)
+    assert not target.exists()
+    target.write_text(json.dumps({"schema_version": 1, "window_opacity": value}), encoding="utf-8")
+    with pytest.raises(SettingsError, match="window_opacity"):
+        load_settings(target)
+
+
+@pytest.mark.parametrize("value", [0, 1, 1.0, "true", None, [], {}])
+def test_transparency_flag_requires_a_boolean_when_saving_and_loading(tmp_path, value):
+    target = tmp_path / "settings.json"
+    with pytest.raises(SettingsError, match="window_transparency_enabled"):
+        save_settings(replace(AppSettings(), window_transparency_enabled=value), target)
+    assert not target.exists()
+    target.write_text(json.dumps({"schema_version": 1, "window_transparency_enabled": value}), encoding="utf-8")
+    with pytest.raises(SettingsError, match="window_transparency_enabled"):
+        load_settings(target)
+
+
 @pytest.mark.parametrize("source", ["{", "[]", "null", "{}", '{"schema_version": true}', '{"schema_version": 2}'])
 def test_malformed_or_unsupported_settings_raise(tmp_path, source):
     target = tmp_path / "settings.json"
@@ -65,7 +118,7 @@ def test_malformed_or_unsupported_settings_raise(tmp_path, source):
     ("field", "value"),
     [
         ("font_size", 15), ("font_size", 41), ("font_size", True),
-        ("window_opacity", 69), ("window_opacity", 101), ("window_opacity", 90.0),
+        ("window_opacity", 29), ("window_opacity", 101), ("window_opacity", 90.0),
         ("show_original", 1), ("always_on_top", "true"),
         ("asr_model", None), ("translation_spm", "bad\x00path"),
         ("mdx_model_file", None), ("mdx_model_file", "bad\x00path"),

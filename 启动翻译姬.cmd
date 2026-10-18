@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "app=%~dp0dist\0.5.1-voice\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
+set "app=%~dp0dist\0.5.2-voice\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
 set "profile=%~dp0settings\voice.settings.json"
 if not exist "%app%" (
   echo FanyiJiVoiceNext executable was not found. Keep the complete project folder.

@@ -20,6 +20,11 @@ def forbidden(*_args, **_kwargs):
     raise AssertionError("Audio capture, model loading or settings access was unexpected")
 
 
+@pytest.fixture
+def stable_version(monkeypatch):
+    monkeypatch.setattr(application, "__version__", "0.5.1")
+
+
 def test_voice_smoke_uses_fake_runtime_and_never_reads_or_writes_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(audio_runtime.VoiceRuntime, "start", forbidden)
     monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
@@ -280,7 +285,7 @@ def test_update_restart_preserves_explicit_profile_and_model_cli(monkeypatch, tm
 
 @pytest.mark.parametrize("frozen", [False, True])
 @pytest.mark.parametrize("appdata_name", ["normal-local", "packages-localcache"])
-def test_project_profile_wins_for_source_and_standard_dist_under_different_appdata(monkeypatch, tmp_path, frozen, appdata_name):
+def test_project_profile_wins_for_source_and_standard_dist_under_different_appdata(monkeypatch, tmp_path, frozen, appdata_name, stable_version):
     project, source = make_project(tmp_path)
     profile = project / "settings/voice.settings.json"
     saved = write_profile(profile, recognition_backend="whisper", translation_backend="hymt", system_audio_processing="mdx_gtcrn")
@@ -306,7 +311,7 @@ def test_project_profile_wins_for_source_and_standard_dist_under_different_appda
     probe_normal_startup(monkeypatch, [], check)
 
 
-def test_project_direct_exe_discovers_models_from_same_project_root(monkeypatch, tmp_path):
+def test_project_direct_exe_discovers_models_from_same_project_root(monkeypatch, tmp_path, stable_version):
     project, _source = make_project(tmp_path)
     profile = project / "settings/voice.settings.json"
     write_profile(profile)
@@ -392,7 +397,7 @@ def test_standard_dist_layout_requires_valid_project_identity_marker(monkeypatch
 
 @pytest.mark.parametrize("selection", ["auto-project", "explicit-project", "required-explicit"])
 @pytest.mark.parametrize("problem", ["missing", "invalid-json", "invalid-setting"])
-def test_selected_profile_errors_are_actionable_and_never_create_window_or_load_models(monkeypatch, tmp_path, selection, problem):
+def test_selected_profile_errors_are_actionable_and_never_create_window_or_load_models(monkeypatch, tmp_path, selection, problem, stable_version):
     qt_app = QApplication.instance() or QApplication([])
     project, source = make_project(tmp_path)
     target = tmp_path / "chosen.json" if selection == "required-explicit" else project / "settings/voice.settings.json"
@@ -422,6 +427,118 @@ def test_selected_profile_errors_are_actionable_and_never_create_window_or_load_
     evidence = json.loads(report.read_text(encoding="utf-8"))
     assert evidence["settings_file"] == str(target.resolve())
     assert evidence["audio_capture"] is evidence["models_loaded"] is evidence["settings_written"] is False
+    qt_app.processEvents()
+
+
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_dev_project_first_start_reads_stable_only_then_saves_and_reopens_preview(monkeypatch, tmp_path, required, frozen):
+    project, source = make_project(tmp_path)
+    formal = project / "settings/voice.settings.json"
+    saved = write_profile(formal, recognition_backend="whisper", translation_backend="hymt",
+                          system_audio_processing="mdx_gtcrn")
+    legacy = json.loads(formal.read_text(encoding="utf-8"))
+    legacy.pop("window_transparency_enabled")
+    formal.write_text(json.dumps(legacy), encoding="utf-8")
+    before = formal.read_bytes()
+    preview = formal.with_name("voice.preview.settings.json")
+    monkeypatch.setattr(application, "__version__", "0.5.2-dev")
+    monkeypatch.setattr(application, "__file__", str(source))
+    monkeypatch.setattr(application.sys, "frozen", frozen, raising=False)
+    monkeypatch.setattr(application.sys, "executable", str(project / "dist/0.5.2-dev-voice/FanyiJiVoiceNext/FanyiJiVoiceNext.exe"))
+    original_save = settings.save_settings
+    arguments = ["--require-settings"] if required else []
+
+    def change_transparency(window):
+        assert formal.read_bytes() == before and not preview.exists()
+        assert window._settings_source == str(preview.resolve())
+        assert window._controller._settings_file == preview.resolve()
+        assert window.settings.recognition_backend == saved.recognition_backend
+        assert window.settings.translation_backend == saved.translation_backend
+        assert window.settings.system_audio_processing == saved.system_audio_processing
+        monkeypatch.setattr(settings, "save_settings", original_save)
+        window.transparency_slider.setValue(45)
+        assert window.settings.window_opacity == 55
+        assert window._controller._accepted_settings == window.settings
+        assert preview.is_file() and formal.read_bytes() == before
+
+    probe_normal_startup(monkeypatch, arguments, change_transparency)
+    preview_before = preview.read_bytes()
+
+    def check_reopened(window):
+        assert window._settings_source == str(preview.resolve())
+        assert window._controller._settings_file == preview.resolve()
+        assert window.settings.window_opacity == 55
+        assert window.settings.window_transparency_enabled is True
+        assert window.settings.recognition_backend == saved.recognition_backend
+        assert window.settings.translation_backend == saved.translation_backend
+
+    probe_normal_startup(monkeypatch, arguments, check_reopened)
+    assert formal.read_bytes() == before and preview.read_bytes() == preview_before
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_dev_explicit_stable_profile_still_overrides_existing_preview(monkeypatch, tmp_path, required):
+    project, source = make_project(tmp_path)
+    formal = project / "settings/voice.settings.json"
+    write_profile(formal, recognition_backend="sensevoice", translation_backend="m2m100", window_opacity=100)
+    preview = formal.with_name("voice.preview.settings.json")
+    write_profile(preview, recognition_backend="whisper", translation_backend="hymt", window_opacity=45)
+    formal_before, preview_before = formal.read_bytes(), preview.read_bytes()
+    monkeypatch.setattr(application, "__version__", "0.5.2-dev")
+    monkeypatch.setattr(application, "__file__", str(source))
+    monkeypatch.setattr(application.sys, "frozen", False, raising=False)
+
+    def check(window):
+        assert window._settings_source == str(formal.resolve())
+        assert window._controller._settings_file == formal.resolve()
+        assert window.settings.recognition_backend == "sensevoice"
+        assert window.settings.translation_backend == "m2m100"
+        assert window.settings.window_opacity == 100
+
+    arguments = ["--settings-file", str(formal)] + (["--require-settings"] if required else [])
+    probe_normal_startup(monkeypatch, arguments, check)
+    assert formal.read_bytes() == formal_before and preview.read_bytes() == preview_before
+
+
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("problem", ["both-missing", "invalid-formal-json", "invalid-formal-setting",
+                                     "invalid-preview-json", "invalid-preview-setting", "preview-directory"])
+def test_dev_default_profile_error_reports_actual_read_source_without_falling_back(monkeypatch, tmp_path, required, problem):
+    qt_app = QApplication.instance() or QApplication([])
+    project, source = make_project(tmp_path)
+    formal = project / "settings/voice.settings.json"
+    preview = formal.with_name("voice.preview.settings.json")
+    if problem != "both-missing":
+        write_profile(formal, recognition_backend="whisper", translation_backend="hymt")
+    selected = preview if "preview" in problem else formal
+    if problem.endswith("json"):
+        selected.write_text("{invalid fixture JSON", encoding="utf-8")
+    elif problem.endswith("setting"):
+        selected.write_text('{"schema_version":1,"recognition_backend":"invalid"}', encoding="utf-8")
+    elif problem == "preview-directory":
+        preview.mkdir()
+    before = {path: path.read_bytes() for path in (formal, preview) if path.is_file()}
+    monkeypatch.setattr(application, "__version__", "0.5.2-dev")
+    monkeypatch.setattr(application, "__file__", str(source))
+    monkeypatch.setattr(application.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(studio, "StudioWindow", forbidden)
+    monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
+    monkeypatch.setattr(audio_runtime.VoiceRuntime, "start", forbidden)
+    monkeypatch.setattr(settings, "save_settings", forbidden)
+    monkeypatch.setattr(QApplication, "exec", forbidden)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda parent, title, message: messages.append(message))
+    report = tmp_path / "startup-error.json"
+    arguments = ["--report", str(report)] + (["--require-settings"] if required else [])
+    assert application.main(arguments) == 2
+    assert len(messages) == 1 and str(selected.resolve()) in messages[0]
+    evidence = json.loads(report.read_text(encoding="utf-8"))
+    assert evidence["settings_file"] == str(selected.resolve())
+    assert evidence["audio_capture"] is evidence["models_loaded"] is evidence["settings_written"] is False
+    assert all(path.read_bytes() == data for path, data in before.items())
+    if "preview" not in problem:
+        assert not preview.exists()
     qt_app.processEvents()
 
 

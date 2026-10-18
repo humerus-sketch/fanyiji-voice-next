@@ -108,7 +108,8 @@ def validate_settings(settings: AppSettings) -> None:
     _expect_int(settings.font_size, "font_size", 16, 40)
     _expect_bool(settings.show_original, "show_original")
     _expect_bool(settings.always_on_top, "always_on_top")
-    _expect_int(settings.window_opacity, "window_opacity", 70, 100)
+    _expect_bool(settings.window_transparency_enabled, "window_transparency_enabled")
+    _expect_int(settings.window_opacity, "window_opacity", 30, 100)
 
 
 def _read_channel(data: Any, name: str, default: ChannelSettings) -> ChannelSettings:

@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGraphicsDropShadowEffect,
     QDialog, QDialogButtonBox, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .models import AppSettings, CaptionStore, RuntimeEvent
@@ -771,8 +771,12 @@ class StudioWindow(QMainWindow):
             self.history_button.setToolTip("本窗口内保留全部字幕；点击返回最新。需要留存时可手动导出。")
             self.history_button.clicked.connect(self._return_to_latest)
         self.focus_button = action("专注", "focus", checkable=True)
+        self.transparency_button = action("透明", name="chipButton", checkable=True)
+        self.transparency_button.setAccessibleName("窗口透明开关")
+        self.transparency_button.setVisible(not self.prototype)
+        self.transparency_button.toggled.connect(self._transparency_toggled)
         self.settings_button = action("阅读设置", "settings", checkable=True)
-        for control in (self.history_button, self.focus_button, self.settings_button):
+        for control in (self.history_button, self.focus_button, self.transparency_button, self.settings_button):
             top_layout.addWidget(control)
         outer.addWidget(top)
 
@@ -993,6 +997,25 @@ class StudioWindow(QMainWindow):
         self.topmost_checkbox = QCheckBox("保持窗口置顶")
         self.topmost_checkbox.toggled.connect(self._appearance_changed)
         layout.addWidget(self.topmost_checkbox)
+        transparency = QWidget()
+        transparency.setVisible(not self.prototype)
+        transparency_layout = QVBoxLayout(transparency)
+        transparency_layout.setContentsMargins(0, 0, 0, 0)
+        transparency_layout.setSpacing(8)
+        transparency_row = QHBoxLayout()
+        transparency_row.addWidget(text_label("窗口透明度"))
+        transparency_row.addStretch()
+        self.transparency_value_label = text_label(name="footerHint")
+        transparency_row.addWidget(self.transparency_value_label)
+        transparency_layout.addLayout(transparency_row)
+        self.transparency_slider = QSlider(Qt.Orientation.Horizontal)
+        self.transparency_slider.setRange(0, 70)
+        self.transparency_slider.setPageStep(10)
+        self.transparency_slider.setAccessibleName("窗口透明度")
+        self.transparency_slider.setToolTip("0% 为不透明，最高 70%；调整后立即应用，仅改变主窗口。")
+        self.transparency_slider.valueChanged.connect(self._transparency_level_changed)
+        transparency_layout.addWidget(self.transparency_slider)
+        layout.addWidget(transparency)
         self.motion_checkbox = QCheckBox("减少动态效果")
         self.motion_checkbox.toggled.connect(self._motion_changed)
         layout.addWidget(self.motion_checkbox)
@@ -1099,12 +1122,12 @@ class StudioWindow(QMainWindow):
         self.show_error(message)
 
     def _shortcut(self, callback):
-        if not isinstance(QApplication.focusWidget(), (QLineEdit, QComboBox, QSpinBox, QCheckBox)):
+        if not isinstance(QApplication.focusWidget(), (QLineEdit, QComboBox, QSpinBox, QCheckBox, QSlider)):
             callback()
 
     def _keyboard_focus_changed(self, *_args):
         focused = QApplication.focusWidget()
-        editing = isinstance(focused, (QLineEdit, QComboBox, QSpinBox, QCheckBox))
+        editing = isinstance(focused, (QLineEdit, QComboBox, QSpinBox, QCheckBox, QSlider))
         for key, shortcut in self._reading_shortcuts:
             # Disable before Qt resolves shortcuts so controls receive their native keys.
             shortcut.setEnabled(not editing and not (key == "Space" and isinstance(focused, QAbstractButton)))
@@ -1148,7 +1171,7 @@ class StudioWindow(QMainWindow):
                 self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
                 if visible:
                     self.show()
-            self.setWindowOpacity(max(30, min(100, settings.window_opacity)) / 100)
+            self._sync_transparency_controls()
             if not self.prototype:
                 self._sync_voice_controls()
         finally:
@@ -1159,6 +1182,40 @@ class StudioWindow(QMainWindow):
             return
         self.update_settings(replace(self.settings, font_size=self.font_size.value(), show_original=self.original_checkbox.isChecked(), always_on_top=self.topmost_checkbox.isChecked()))
         self.settings_changed.emit(self.settings)
+
+    def _sync_transparency_controls(self):
+        opacity = max(30, min(100, self.settings.window_opacity))
+        enabled = self.settings.window_transparency_enabled
+        percentage = 100 - opacity
+        self.transparency_button.setChecked(enabled and percentage > 0)
+        self.transparency_slider.setValue(percentage)
+        suffix = " · 已关闭" if not enabled and percentage else ""
+        self.transparency_value_label.setText(f"{percentage}%{suffix}")
+        self.transparency_button.setToolTip(f"窗口透明度 {percentage}%{suffix}；在阅读设置中调整，点击可开启或关闭。")
+        self.setWindowOpacity(opacity / 100 if enabled else 1.0)
+
+    def _change_transparency(self, **values):
+        self.settings = replace(self.settings, **values)
+        self._applying = True
+        try:
+            # Window appearance changes must not rebuild or scroll the caption stream.
+            self._sync_transparency_controls()
+        finally:
+            self._applying = False
+        self.settings_changed.emit(self.settings)
+
+    def _transparency_toggled(self, enabled):
+        if self._applying:
+            return
+        opacity = self.settings.window_opacity
+        if enabled and opacity == 100:
+            opacity = 80
+        self._change_transparency(window_opacity=opacity, window_transparency_enabled=enabled)
+
+    def _transparency_level_changed(self, percentage):
+        if self._applying:
+            return
+        self._change_transparency(window_opacity=100 - percentage, window_transparency_enabled=True)
 
     def _source_changed(self, *_args):
         if self._applying:
@@ -1336,6 +1393,7 @@ class StudioWindow(QMainWindow):
     def _sync_reading_density(self):
         compact = self.height() < 760
         self.welcome.setVisible(not compact and not self.focus_button.isChecked())
+        self.transparency_button.setVisible(not self.prototype and self.width() >= 1180)
         if self.prototype:
             self.history_section.setFixedHeight(120 if compact else 160)
         else:

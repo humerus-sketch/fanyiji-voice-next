@@ -150,6 +150,21 @@ def smoke_test(screenshot=None, report_path=None):
         runtimes[0].callback(RuntimeEvent("translation", controller.session_id, channel, segment_id, text=translated))
     _settle(app)
     checks["paired_captions"] = len(window.store.items()) == 4 and all(item.original and item.translated for item in window.store.items())
+    caption_ids = [item.id for item in window.store.items()]
+    window.transparency_button.click()
+    window.transparency_slider.setValue(45)
+    _settle(app)
+    checks["transparency_adjusts_live"] = (
+        window.settings.window_opacity == 55 and abs(window.windowOpacity() - .55) < .01)
+    window.transparency_button.click()
+    checks["transparency_turns_off"] = abs(window.windowOpacity() - 1) < .01
+    window.transparency_button.click()
+    checks["transparency_restores_level"] = (
+        window.settings.window_opacity == 55 and abs(window.windowOpacity() - .55) < .01)
+    checks["transparency_preserves_session"] = (
+        len(runtimes) == 1 and runtimes[0].is_running and controller.state == "running"
+        and [item.id for item in window.store.items()] == caption_ids)
+    window.transparency_slider.setValue(0)
     failed_channel, failed_id, failed_source, restored_translation = examples[2]
     failure_message = "界面检查：本句翻译未完成。"
     notice_started = perf_counter()
@@ -268,13 +283,21 @@ def main(argv=None):
     project_root = _discover_project_root()
     project_profile = project_root / "settings" / "voice.settings.json" if project_root is not None else None
     target = (args.settings_file or project_profile or settings_path()).resolve()
-    strict_profile = args.require_settings or (project_profile is not None and target == project_profile.resolve())
+    preview_profile = args.settings_file is None and project_profile is not None and __version__.endswith("-dev")
+    if preview_profile:
+        target = (project_root / "settings" / "voice.preview.settings.json").resolve()
+        # Read the stable profile only to seed a first preview in memory. Future
+        # edits belong to the preview target so older releases stay compatible.
+        source = target if target.exists() else project_profile.resolve()
+    else:
+        source = target
+    strict_profile = args.require_settings or preview_profile or (project_profile is not None and target == project_profile.resolve())
     error = None
     try:
-        if strict_profile and not target.is_file():
-            return _startup_profile_error(target, "配置文件不存在或不是普通文件。", args.report)
-        if target.exists():
-            settings = load_settings(target)
+        if strict_profile and not source.is_file():
+            return _startup_profile_error(source, "配置文件不存在或不是普通文件。", args.report)
+        if source.exists():
+            settings = load_settings(source)
         elif getattr(sys, "frozen", False) and args.settings_file is None and project_root is None:
             from .release_profile import load_release_defaults
             defaults = Path(sys.executable).resolve().parent / "release-defaults.json"
@@ -283,7 +306,7 @@ def main(argv=None):
             settings = AppSettings(font_size=30)
     except SettingsError as exc:
         if strict_profile:
-            return _startup_profile_error(target, str(exc), args.report)
+            return _startup_profile_error(source, str(exc), args.report)
         settings = AppSettings(font_size=30)
         error = f"设置读取失败，当前使用默认值：{exc}"
     overrides = {name: getattr(args, name) for name, _choices, _default in BACKEND_OPTIONS

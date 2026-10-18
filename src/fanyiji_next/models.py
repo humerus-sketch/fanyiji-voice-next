@@ -42,6 +42,7 @@ class AppSettings:
     system_audio_processing: str = "raw"
     mdx_model_file: str = ""
     gtcrn_model_file: str = ""
+    window_transparency_enabled: bool = True
 
 
 @dataclass(frozen=True)

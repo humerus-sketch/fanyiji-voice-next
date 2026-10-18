@@ -49,6 +49,23 @@ def inputs(tmp_path, packager):
     return dict(program_folder=program, models=models, runtime=runtime, output=tmp_path / "release", version="0.5.0")
 
 
+@pytest.fixture
+def release_defaults_050():
+    # Published 0.5.0 payload, independent of the current defaults generator.
+    return {
+        "schema_version": 1,
+        "microphone": {"enabled": False, "direction": "zh_to_ja", "device_index": None},
+        "system": {"enabled": True, "direction": "ja_to_zh", "device_index": None},
+        "asr_model": "", "asr_tokens": "", "translation_model_dir": "", "translation_spm": "",
+        "font_size": 30, "show_original": True, "always_on_top": False, "window_opacity": 100,
+        "recognition_backend": "whisper", "whisper_model_dir": "", "recognition_device": "cuda",
+        "recognition_compute_type": "int8_float16", "translation_backend": "hymt",
+        "nllb_model_dir": "", "nllb_tokenizer_dir": "", "hymt_model_file": "", "hymt_server_exe": "",
+        "translation_device": "cuda", "translation_compute_type": "int8_float16", "vad_model": "",
+        "system_audio_processing": "mdx_gtcrn", "mdx_model_file": "", "gtcrn_model_file": "",
+    }
+
+
 def test_release_defaults_keep_current_engines_without_user_paths(tmp_path):
     path = tmp_path / "release-defaults.json"
     write_release_defaults(path)
@@ -59,12 +76,39 @@ def test_release_defaults_keep_current_engines_without_user_paths(tmp_path):
     assert settings.system_audio_processing == "mdx_gtcrn"
     assert not settings.microphone.enabled and settings.system.enabled
     assert settings.microphone.device_index is settings.system.device_index is None
+    assert settings.window_transparency_enabled is True and settings.window_opacity == 100
+    assert release_defaults_payload()["window_transparency_enabled"] is True
     assert all(not value for key, value in release_defaults_payload().items()
                if key.endswith(("_model", "_tokens", "_model_dir", "_tokenizer_dir", "_model_file", "_server_exe", "_spm")))
     assert list(tmp_path.iterdir()) == [path]
     before = path.read_bytes()
     with pytest.raises(FileExistsError):
         write_release_defaults(path)
+    assert path.read_bytes() == before
+
+
+def test_published_050_defaults_gain_only_the_missing_transparency_flag_without_rewriting(tmp_path, release_defaults_050):
+    path = tmp_path / "release-defaults.json"
+    path.write_text(json.dumps(release_defaults_050), encoding="utf-8")
+    before = path.read_bytes()
+    settings = load_release_defaults(path)
+    assert settings.window_transparency_enabled is True and settings.window_opacity == 100
+    assert settings.recognition_backend == "whisper" and settings.translation_backend == "hymt"
+    assert settings.system_audio_processing == "mdx_gtcrn"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("change", [
+    {"unknown": True}, {"window_transparency_enabled": False}, {"window_transparency_enabled": 1},
+    {"recognition_backend": "sensevoice"}, {"translation_backend": "m2m100"},
+    {"window_opacity": 85}, {"hymt_model_file": "C:/private/model.gguf"},
+])
+def test_legacy_defaults_migration_keeps_all_other_strict_checks(tmp_path, release_defaults_050, change):
+    path = tmp_path / "release-defaults.json"
+    path.write_text(json.dumps(release_defaults_050 | change), encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(SettingsError):
+        load_release_defaults(path)
     assert path.read_bytes() == before
 
 

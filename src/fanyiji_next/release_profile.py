@@ -42,6 +42,9 @@ def load_release_defaults(path: Path) -> AppSettings:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SettingsError(f"无法读取发布默认配置：{path.name}；{exc}") from exc
+    if isinstance(payload, dict) and "window_transparency_enabled" not in payload:
+        # Published 0.5.x defaults predate this flag; migrate only in memory.
+        payload = {**payload, "window_transparency_enabled": True}
     if payload != release_defaults_payload():
         raise SettingsError("发布默认配置与当前版本不匹配；不接受设备号、用户路径或额外配置。")
     return load_settings(path)

@@ -465,6 +465,195 @@ def test_voice_runtime_locks_sources_but_keeps_reading_settings_available(studio
     assert all(control.isEnabled() for pair in widget.channel_controls.values() for control in pair)
 
 
+def test_voice_transparency_toggle_uses_default_level_and_restores_saved_level(studio):
+    widget, app = studio(prototype=False)
+    saved = []
+    widget.settings_changed.connect(saved.append)
+    assert not widget.transparency_button.isChecked()
+    assert widget.transparency_slider.value() == 0
+    assert widget.transparency_value_label.text() == "0%"
+    assert widget.windowOpacity() == pytest.approx(1.0)
+    widget.transparency_button.click()
+    settle(app)
+    assert widget.settings.window_transparency_enabled
+    assert widget.settings.window_opacity == 80
+    assert widget.transparency_slider.value() == 20
+    assert widget.transparency_value_label.text() == "20%"
+    assert widget.windowOpacity() == pytest.approx(.8, abs=1 / 255)
+    widget.transparency_button.click()
+    assert not widget.settings.window_transparency_enabled
+    assert widget.settings.window_opacity == 80
+    assert widget.windowOpacity() == pytest.approx(1.0)
+    assert widget.transparency_value_label.text() == "20% · 已关闭"
+    widget.transparency_button.click()
+    assert widget.settings.window_opacity == 80
+    assert widget.windowOpacity() == pytest.approx(.8, abs=1 / 255)
+    assert len(saved) == 3 and saved[-1] == widget.settings
+
+
+def test_voice_legacy_transparency_and_disabled_settings_restore_without_writes(studio):
+    widget, app = studio(AppSettings(window_opacity=85), prototype=False)
+    saved = []
+    widget.settings_changed.connect(saved.append)
+    assert widget.transparency_button.isChecked()
+    assert widget.transparency_slider.value() == 15
+    assert widget.windowOpacity() == pytest.approx(.85, abs=1 / 255)
+    disabled = replace(widget.settings, window_transparency_enabled=False)
+    widget.update_settings(disabled)
+    settle(app)
+    assert not saved
+    assert not widget.transparency_button.isChecked()
+    assert widget.transparency_slider.value() == 15
+    assert widget.windowOpacity() == pytest.approx(1.0)
+    reopened, _app = studio(disabled, prototype=False)
+    assert reopened.windowOpacity() == pytest.approx(1.0)
+    assert reopened.transparency_slider.value() == 15
+    reopened.transparency_button.click()
+    assert reopened.settings.window_opacity == 85
+    assert reopened.windowOpacity() == pytest.approx(.85, abs=1 / 255)
+    external = replace(widget.settings, window_opacity=60, window_transparency_enabled=True)
+    widget.update_settings(external)
+    settle(app)
+    assert not saved
+    assert widget.transparency_button.isChecked()
+    assert widget.transparency_slider.value() == 40
+    assert widget.transparency_value_label.text() == "40%"
+    assert widget.windowOpacity() == pytest.approx(.6, abs=1 / 255)
+
+
+def test_voice_transparency_slider_enables_effect_and_zero_is_opaque(studio):
+    widget, _app = studio(AppSettings(window_opacity=85, window_transparency_enabled=False), prototype=False)
+    saved = []
+    widget.settings_changed.connect(saved.append)
+    assert widget.transparency_slider.minimum() == 0 and widget.transparency_slider.maximum() == 70
+    widget.transparency_slider.setValue(70)
+    assert widget.settings.window_transparency_enabled and widget.settings.window_opacity == 30
+    assert widget.transparency_value_label.text() == "70%"
+    assert widget.transparency_button.isChecked()
+    assert widget.windowOpacity() == pytest.approx(.3, abs=1 / 255)
+    widget.transparency_slider.setValue(0)
+    assert widget.settings.window_transparency_enabled and widget.settings.window_opacity == 100
+    assert not widget.transparency_button.isChecked()
+    assert widget.windowOpacity() == pytest.approx(1.0)
+    widget.transparency_button.click()
+    assert widget.settings.window_opacity == 80 and widget.transparency_slider.value() == 20
+    assert len(saved) == 3
+
+
+def test_voice_transparency_changes_only_main_window_without_restarting_runtime_or_rebuilding_history(studio, monkeypatch):
+    from fanyiji_next.controller import AppController
+
+    runtimes = []
+    class QuietRuntime:
+        def __init__(self, callback):
+            self.callback = callback
+            self.is_running = False
+            self.stop_count = 0
+            self.start_count = 0
+            runtimes.append(self)
+
+        def start(self, _settings, session_id):
+            self.start_count += 1
+            self.is_running = True
+            self.session_id = session_id
+            self.callback(RuntimeEvent("state", session_id, status="running"))
+
+        def stop(self):
+            self.stop_count += 1
+            self.is_running = False
+            self.callback(RuntimeEvent("state", self.session_id, status="stopped"))
+
+    widget, app = studio(prototype=False)
+    controller = AppController(widget, runtime_factory=QuietRuntime, persist_settings=False, device_lister=lambda: [])
+    widget.start_button.click()
+    settle(app)
+    for index in range(40):
+        add_caption(widget, index, "system", translated="保留这段字幕与回看位置。" * 5)
+    settle(app)
+    panel = widget.panels["system"]
+    bar = panel.history_scroll.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    settle(app)
+    anchor_id, top = panel._find_review_anchor()
+    rows = tuple(panel.rows.values())
+    captions = [(id(item), item.original, item.translated) for item in widget.store.items()]
+    original_settings = widget.settings
+    dialog = widget.open_runtime_settings()
+    settle(app)
+
+    def no_caption_rebuild(*_args):
+        raise AssertionError("Transparency must not rebuild the caption stream")
+
+    with monkeypatch.context() as scoped:
+        for channel_panel in widget.panels.values():
+            scoped.setattr(channel_panel, "update_settings", no_caption_rebuild)
+        widget.transparency_button.click()
+        widget.transparency_slider.setValue(35)
+        widget.transparency_button.click()
+        widget.transparency_slider.setValue(45)
+    settle(app)
+    assert controller.state == "running" and len(runtimes) == 1
+    assert runtimes[0].start_count == 1 and runtimes[0].stop_count == 0
+    assert runtimes[0].is_running and widget._voice_resources_active
+    assert controller._accepted_settings == widget.settings
+    assert widget.settings.microphone == original_settings.microphone
+    assert widget.settings.system == original_settings.system
+    assert widget.settings.recognition_backend == original_settings.recognition_backend
+    assert widget.settings.translation_backend == original_settings.translation_backend
+    assert widget.settings.system_audio_processing == original_settings.system_audio_processing
+    assert captions == [(id(item), item.original, item.translated) for item in widget.store.items()]
+    assert rows == tuple(panel.rows.values())
+    assert panel.rows[anchor_id].mapTo(panel.history_scroll.viewport(), QPoint()).y() == top
+    assert not panel.follow_button.isChecked()
+    assert dialog.windowOpacity() == pytest.approx(1.0)
+    assert dialog.isVisible() and not dialog.apply_button.isEnabled()
+    assert widget.windowOpacity() == pytest.approx(.55, abs=1 / 255)
+    dialog.reject()
+    controller.stop_session()
+    settle(app)
+    controller.shutdown()
+
+
+@pytest.mark.parametrize("size", [(1000, 600), (1100, 760), (1264, 632), (1440, 900)])
+def test_voice_transparency_controls_fit_narrow_windows_and_remain_in_reading_settings(studio, size):
+    settings = AppSettings(recognition_backend="whisper", translation_backend="hymt", system_audio_processing="mdx_gtcrn")
+    widget, app = studio(settings, prototype=False)
+    widget.resize(*size)
+    settle(app)
+    assert widget.size().toTuple() == size
+    assert widget.transparency_button.isVisible() is (size[0] >= 1180)
+    for control in (widget.model_button, widget.history_button, widget.focus_button, widget.settings_button):
+        assert_inside(widget, control)
+    if widget.transparency_button.isVisible():
+        assert_inside(widget, widget.transparency_button)
+    widget.settings_button.click()
+    settle(app)
+    assert widget.drawer.isVisible() and widget.transparency_slider.isVisible()
+    assert widget.transparency_slider.isEnabled()
+    assert widget.transparency_slider.accessibleName() == "窗口透明度"
+    assert widget.transparency_slider.width() > 100
+
+
+@pytest.mark.parametrize("state", ["stopped", "running"])
+def test_space_on_transparency_slider_never_starts_or_stops_audio(studio, state):
+    widget, app = studio(prototype=False)
+    widget.set_session_state(state)
+    actions = []
+    widget.start_requested.connect(lambda _settings: actions.append("start"))
+    widget.stop_requested.connect(lambda: actions.append("stop"))
+    widget.settings_button.click()
+    widget.transparency_slider.setFocus()
+    settle(app)
+    assert QApplication.focusWidget() is widget.transparency_slider
+    assert all(not shortcut.isEnabled() for _key, shortcut in widget._reading_shortcuts)
+    QTest.keyClick(widget.transparency_slider, Qt.Key.Key_Space)
+    QTest.keyClick(widget.transparency_slider, Qt.Key.Key_Right)
+    settle(app)
+    assert actions == []
+    assert widget.transparency_slider.value() == 1
+    assert widget.settings.window_opacity == 99
+
+
 def test_voice_error_keeps_resources_locked_until_stopped(studio):
     widget, _app = studio(prototype=False)
     widget.set_session_state("loading")
