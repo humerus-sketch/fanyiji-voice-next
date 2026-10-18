@@ -98,7 +98,8 @@ def _baseline(folder: Path, manifest: Path, expected_sha256: str, expected_versi
         raise ValueError("基线目录文件与发布 full-manifest.json 不一致")
     verified, model_count = {}, 0
     for relative, file in actual.items():
-        if PurePosixPath(relative).parts[0] == "models":
+        model_root = PurePosixPath(relative).parts[0].casefold()
+        if model_root == "models" or model_root.endswith("_models"):
             model_count += 1  # Model contents are deliberately not reread or copied.
             continue
         _validate_program_path(relative)
@@ -146,7 +147,8 @@ def package_patch(*, program_folder: Path, baseline_folder: Path, baseline_manif
         _validate_program_path(relative)
         updater._case_path(PurePosixPath(relative), spellings)
         # The build has no model directory: do not silently skip weights here.
-        if PurePosixPath(relative).parts[0].casefold() == "models":
+        model_root = PurePosixPath(relative).parts[0].casefold()
+        if model_root == "models" or model_root.endswith("_models"):
             raise ValueError("补丁构建不得包含模型")
         if relative == "_internal/certifi/cacert.pem":
             pem = file.read_bytes()

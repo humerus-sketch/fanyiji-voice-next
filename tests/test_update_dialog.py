@@ -86,6 +86,18 @@ def test_default_dialog_constructs_real_client_for_configured_repository(window)
     assert not dialog.install_button.isEnabled()
 
 
+def test_update_error_expires_after_three_seconds_without_resetting_on_duplicate(window):
+    dialog = ui.UpdateDialog(window, frozen=True)
+    dialog._show_error("网络错误")
+    assert dialog._error_timer.interval() == 3000
+    remaining = dialog._error_timer.remainingTime()
+    dialog._show_error("网络错误")
+    assert dialog._error_timer.remainingTime() <= remaining
+    dialog._error_timer.timeout.emit()
+    assert not dialog.status_label.text()
+    assert not dialog._closed and dialog.check_button.isEnabled()
+
+
 def test_install_uses_module_helper_and_preserves_restart_arguments(window, monkeypatch):
     # A real client intentionally has no launch_helper method: this catches the
     # previous interface mismatch that permissive fake clients concealed.

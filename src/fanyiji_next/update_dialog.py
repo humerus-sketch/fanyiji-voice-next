@@ -65,7 +65,22 @@ class UpdateDialog(QDialog):
         self._controls_timer.setInterval(250)
         self._controls_timer.timeout.connect(self._refresh_controls)
         self._controls_timer.start()
+        self._error_timer = QTimer(self)
+        self._error_timer.setSingleShot(True)
+        self._error_timer.timeout.connect(self._clear_error)
+        self._last_error = ""
         self._refresh_controls()
+
+    def _show_error(self, message):
+        if message == self._last_error and self._error_timer.isActive() and self.status_label.text() == message:
+            return
+        self._last_error = message
+        self.status_label.setText(message)
+        self._error_timer.start(3000)
+
+    def _clear_error(self):
+        if self.status_label.text() == self._last_error:
+            self.status_label.clear()
 
     def _busy(self):
         return self._worker is not None and self._worker.is_alive()
@@ -143,7 +158,7 @@ class UpdateDialog(QDialog):
         self._worker = None
         self.progress_bar.setRange(0, 1000)
         if error is not None:
-            self.status_label.setText("更新已取消。" if isinstance(error, UpdateCancelled) else f"更新未完成：{error}")
+            self._show_error("更新已取消。" if isinstance(error, UpdateCancelled) else f"更新未完成：{error}")
             self.progress_bar.setValue(0)
         elif kind == "check":
             self.info = result
@@ -172,13 +187,13 @@ class UpdateDialog(QDialog):
         if self._closed or self._busy() or self.prepared is None or not self.frozen:
             return
         if getattr(self.window, "_voice_resources_active", False):
-            self.status_label.setText("请先停止翻译，等待声音与模型资源释放后再安装。")
+            self._show_error("请先停止翻译，等待声音与模型资源释放后再安装。")
             self._refresh_controls()
             return
         try:
             launch_helper(self.prepared, restart_args=getattr(self.window, "_update_restart_args", ()))
         except Exception as exc:
-            self.status_label.setText(f"无法启动更新：{exc}")
+            self._show_error(f"无法启动更新：{exc}")
             return
         self.status_label.setText("正在退出并安装更新…")
         self.install_button.setEnabled(False)
@@ -189,6 +204,7 @@ class UpdateDialog(QDialog):
         self._closed = True
         self._cancel.set()
         self._controls_timer.stop()
+        self._error_timer.stop()
         super().closeEvent(event)
 
 

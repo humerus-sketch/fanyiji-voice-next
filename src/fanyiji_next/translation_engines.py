@@ -306,6 +306,9 @@ class _NllbEngine(_TranslationEngine):
 def create_translation_engine(settings, *, stop_event=None):
     """Load one local backend now; never resolve a model name through a hub."""
     backend = getattr(settings, "translation_backend", "m2m100")
+    if backend == "translategemma":
+        from .gemma_translation import GemmaTranslationEngine
+        return GemmaTranslationEngine(settings, stop_event=stop_event)
     if backend == "m2m100":
         return _M2M100Engine(settings, stop_event)
     if backend == "nllb":

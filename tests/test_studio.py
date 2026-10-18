@@ -33,7 +33,8 @@ def studio():
     windows = []
 
     def create(settings=None, *, prototype=True):
-        widget = StudioWindow(settings, prototype=prototype)
+        # Historical UI contracts below supply an explicit legacy profile.
+        widget = StudioWindow(settings or AppSettings(font_size=30), prototype=prototype)
         windows.append(widget)
         widget.show()
         settle(app)
@@ -762,7 +763,7 @@ def test_voice_device_refresh_is_explicit_and_preserves_per_channel_selection(st
     assert widget.settings.microphone.device_index is None
 
 
-def test_voice_device_failure_stays_visible_in_the_settings_dialog(studio):
+def test_voice_device_failure_expires_without_closing_the_settings_dialog(studio):
     widget, app = studio(prototype=False)
     dialog = widget.open_runtime_settings()
     settle(app)
@@ -771,6 +772,13 @@ def test_voice_device_failure_stays_visible_in_the_settings_dialog(studio):
     assert "WASAPI" in dialog.device_hint.text()
     assert dialog.isVisible() and dialog.apply_button.isEnabled()
     assert not widget.store.items()
+    assert dialog._device_error_timer.interval() == 3000
+    remaining = dialog._device_error_timer.remainingTime()
+    widget.set_device_error("设备枚举失败：WASAPI 不可用。")
+    assert dialog._device_error_timer.remainingTime() <= remaining
+    dialog._device_error_timer.timeout.emit()
+    assert not dialog.device_hint.text()
+    assert dialog.isVisible()
 
 
 def test_voice_volume_and_backlog_events_update_metrics_without_creating_captions(studio):
@@ -861,30 +869,35 @@ def test_prototype_failure_still_displays_original_with_separate_error_details(s
     assert panel.rows["failed"].translated.text() == "预览原文。"
 
 
-def test_recoverable_notice_expires_after_two_seconds_without_extension_for_duplicates(studio):
+def test_recoverable_notice_expires_after_three_seconds_without_extension_for_duplicates(studio):
     widget, app = studio(prototype=False)
     widget.show_recoverable_error("本句翻译未完成。")
     settle(app)
     assert widget.notice.isVisible()
-    assert widget._toast_timer.interval() == 2000
+    assert widget._toast_timer.interval() == 3000
     QTest.qWait(1200)
     remaining = widget._toast_timer.remainingTime()
-    assert 0 < remaining < 1200
+    assert 0 < remaining < 2200
     widget.show_recoverable_error("本句翻译未完成。")
     assert widget._toast_timer.remainingTime() <= remaining + 100
-    QTest.qWait(1000)
+    QTest.qWait(2000)
     assert not widget.notice.isVisible()
     assert not widget._toast_timer.isActive()
 
 
-def test_fatal_error_replaces_transient_notice_and_remains_visible(studio):
+def test_fatal_error_replaces_transient_notice_and_also_expires(studio):
     widget, app = studio(prototype=False)
     widget.show_recoverable_error("本句翻译未完成。")
     widget.show_error("模型载入失败，请检查路径。")
     settle(app)
-    assert not widget._toast_timer.isActive()
-    QTest.qWait(2100)
-    assert widget.notice.isVisible()
+    assert widget._toast_timer.interval() == 3000
+    assert widget._toast_timer.isActive()
+    QTest.qWait(1200)
+    remaining = widget._toast_timer.remainingTime()
+    widget.show_error("模型载入失败，请检查路径。")
+    assert widget._toast_timer.remainingTime() <= remaining + 100
+    QTest.qWait(2000)
+    assert not widget.notice.isVisible()
     assert widget.notice.text() == "模型载入失败，请检查路径。"
 
 

@@ -299,6 +299,9 @@ class WhisperRecognitionEngine(_RecognizerBase):
 
 def create_recognition_engine(settings: AppSettings, *, stop_event: threading.Event | None = None):
     backend = getattr(settings, "recognition_backend", "sensevoice")
+    if backend in {"qwen3_asr", "fun_asr"}:
+        from .ab_recognition import ABRecognitionEngine
+        return ABRecognitionEngine(settings, stop_event=stop_event)
     if backend == "sensevoice":
         return SenseVoiceRecognitionEngine(settings, stop_event=stop_event)
     if backend == "whisper":

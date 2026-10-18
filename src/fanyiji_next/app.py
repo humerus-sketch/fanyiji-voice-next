@@ -51,6 +51,8 @@ def _discover_project_root():
 
 
 def _startup_profile_error(target, detail, report_path):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
     from PySide6.QtWidgets import QMessageBox
 
     message = (f"无法读取启动配置：{target}\n{detail}\n\n"
@@ -59,13 +61,35 @@ def _startup_profile_error(target, detail, report_path):
     write_report({"application": "fanyiji-voice-next", "version": __version__,
                   "startup_error": message, "settings_file": str(target),
                   "audio_capture": False, "models_loaded": False, "settings_written": False}, report_path)
-    QMessageBox.critical(None, "翻译姬 · 启动配置错误", message)
+    title = "翻译姬 · 启动配置错误"
+    timer = QTimer()
+    timer.setSingleShot(True)
+    def dismiss_error():
+        # This timer belongs only to this ordinary error; never accept a
+        # confirmation, license or another window's dialog.
+        for widget in QApplication.topLevelWidgets():
+            if isinstance(widget, QMessageBox) and widget.windowTitle() == title and widget.text() == message:
+                widget.accept()
+    timer.timeout.connect(dismiss_error)
+    timer.start(3000)
+    try:
+        QMessageBox.critical(None, title, message)
+    finally:
+        timer.stop()
     return 2
 
 
-def check_runtime(report_path=None):
+def check_runtime(report_path=None, *, ab_engines=None):
     modules = ("PySide6.QtWidgets", "numpy", "sherpa_onnx", "ctranslate2", "sentencepiece", "pyaudiowpatch", "soxr",
                "faster_whisper", "tokenizers", "av", "onnxruntime", "huggingface_hub", "tqdm")
+    if ab_engines is None and getattr(sys, "frozen", False):
+        try:
+            build_info = json.loads((Path(sys.executable).parent / "build-info.json").read_text(encoding="utf-8"))
+            ab_engines = build_info.get("ab_engines_bundled", False)
+        except (OSError, ValueError):
+            ab_engines = False
+    if ab_engines:
+        modules += ("torch", "torchaudio", "transformers", "funasr", "librosa", "soundfile", "safetensors")
     results = {}
     for name in modules:
         try:
@@ -73,9 +97,24 @@ def check_runtime(report_path=None):
             results[name] = {"available": True, "version": getattr(module, "__version__", "bundled")}
         except Exception as exc:
             results[name] = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    if ab_engines:
+        # Transformers exposes lazy exports: importing only its root package
+        # does not prove the actual audio/model entry points are bundled.
+        for package, attribute in (("transformers", "AutoProcessor"),
+                                   ("transformers", "AutoModelForMultimodalLM"),
+                                   ("funasr", "AutoModel")):
+            name = package + "." + attribute
+            try:
+                entry = getattr(importlib.import_module(package), attribute)
+                if not callable(entry):
+                    raise ImportError("模型入口不是可调用的类")
+                results[name] = {"available": True, "class_module": entry.__module__}
+            except Exception as exc:
+                results[name] = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
     passed = all(result["available"] for result in results.values()) and not _legacy_modules()
     write_report({"application": "fanyiji-voice-next", "version": __version__,
                   "runtime_imports_passed": passed, "audio_capture": False, "models_loaded": False,
+                  "ab_engines_checked": bool(ab_engines),
                   "settings_written": False, "legacy_modules_loaded": _legacy_modules(), "modules": results}, report_path)
     return 0 if passed else 2
 
@@ -176,10 +215,10 @@ def smoke_test(screenshot=None, report_path=None):
         failed_caption.original == failed_source and not failed_caption.translated
         and window.panels[failed_channel].latest_translation.text() == failed_source
         and failure_message not in window.transcript())
-    checks["recoverable_notice_two_second_timer"] = window._toast_timer.interval() == 2000
+    checks["recoverable_notice_three_second_timer"] = window._toast_timer.interval() == 3000
     notice_loop = QEventLoop()
     window._toast_timer.timeout.connect(notice_loop.quit)
-    QTimer.singleShot(2600, notice_loop.quit)
+    QTimer.singleShot(3600, notice_loop.quit)
     notice_loop.exec()
     window._toast_timer.timeout.disconnect(notice_loop.quit)
     notice_elapsed_ms = round((perf_counter() - notice_started) * 1000)
@@ -237,6 +276,7 @@ def main(argv=None):
     modes.add_argument("--smoke-test", action="store_true", help="模拟运行界面和会话控制，不采音、不加载模型、不保存设置")
     modes.add_argument("--check-runtime", action="store_true", help="检查本地运行依赖，不采音或加载模型")
     modes.add_argument("--verify-models", action="store_true", help="仅用固定官方 WAV 验证本地模型，不采音或保存设置")
+    modes.add_argument("--verify-ab-audio", type=Path, help="只读取录音前8秒检查 A/B 推理；需显式配置，不采音或保存设置")
     modes.add_argument("--demo", action="store_true", help="打开保留的界面演示，不采集声音")
     parser.add_argument("--model-root", type=Path, help="为尚未设置的模型提供本地目录，不下载或自动开始")
     parser.add_argument("--settings-file", type=Path, help="使用指定的新项目配置文件")
@@ -251,6 +291,18 @@ def main(argv=None):
         return check_runtime(args.report)
     if args.smoke_test:
         return smoke_test(args.screenshot, args.report)
+    if args.verify_ab_audio is not None:
+        if args.settings_file is None:
+            parser.error("--verify-ab-audio 需要 --settings-file 指定本地 A/B 配置。")
+        try:
+            from .ab_verification import verify_audio
+            result = verify_audio(args.verify_ab_audio, args.settings_file)
+            result.update(application="fanyiji-voice-next", version=__version__, passed=result["nonempty_transcription"])
+        except Exception as exc:
+            result = {"application": "fanyiji-voice-next", "version": __version__, "passed": False,
+                      "error": str(exc), "audio_capture": False, "settings_written": False}
+        write_report(result, args.report)
+        return 0 if result["passed"] else 1
     if args.verify_models:
         if args.model_root is None:
             parser.error("--verify-models 需要 --model-root 指定本地模型目录。")
@@ -275,7 +327,10 @@ def main(argv=None):
     from dataclasses import replace
     from .controller import AppController
     from .models import AppSettings
-    from .settings import SettingsError, load_settings, settings_path, validate_settings, with_local_models
+    from .settings import (SettingsError, load_settings, settings_path, validate_settings,
+                           selected_model_combination, with_model_combination)
+    from .release_profile import new_application_settings
+    from .model_paths import external_model_root
     from .studio import StudioWindow
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -301,13 +356,13 @@ def main(argv=None):
         elif getattr(sys, "frozen", False) and args.settings_file is None and project_root is None:
             from .release_profile import load_release_defaults
             defaults = Path(sys.executable).resolve().parent / "release-defaults.json"
-            settings = load_release_defaults(defaults) if defaults.is_file() else AppSettings(font_size=30)
+            settings = load_release_defaults(defaults) if defaults.is_file() else new_application_settings()
         else:
-            settings = AppSettings(font_size=30)
+            settings = new_application_settings()
     except SettingsError as exc:
         if strict_profile:
             return _startup_profile_error(source, str(exc), args.report)
-        settings = AppSettings(font_size=30)
+        settings = new_application_settings()
         error = f"设置读取失败，当前使用默认值：{exc}"
     overrides = {name: getattr(args, name) for name, _choices, _default in BACKEND_OPTIONS
                  if getattr(args, name) is not None}
@@ -320,7 +375,9 @@ def main(argv=None):
         except SettingsError as exc:
             parser.error(str(exc))
     base = project_root or (Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2])
-    settings = with_local_models(settings, args.model_root or base / "models")
+    # Resolve anew on every launch: renaming the EXE changes the prefix. Never
+    # reuse an old absolute model path, CWD or PyInstaller's extraction folder.
+    settings = with_model_combination(settings, selected_model_combination(settings), external_model_root())
     window = StudioWindow(settings, prototype=False)
     # Preserve explicit profile/model selections when the updater restarts this EXE.
     window._update_restart_args = tuple(sys.argv[1:] if argv is None else argv)
@@ -329,6 +386,28 @@ def main(argv=None):
     window._controller = controller
     from .update_dialog import open_update_dialog
     window.update_requested.connect(lambda: open_update_dialog(window))
+    from .model_download_dialog import ModelDownloadDialog
+
+    def show_models():
+        dialog = getattr(window, "_model_download_dialog", None)
+        if dialog is None:
+            dialog = ModelDownloadDialog(external_model_root(), parent=window,
+                                         capture_active=lambda: controller.state not in {"stopped", "error"})
+            def apply_pair(pair):
+                if controller.state not in {"stopped", "error"} or controller._runtime_busy():
+                    window.show_error("请先停止翻译，再切换 A/B 方案。")
+                    return
+                selected = with_model_combination(window.settings, pair, external_model_root())
+                window.update_settings(selected)
+                window.settings_changed.emit(selected)
+            dialog.bundle_selected.connect(apply_pair)
+            window._model_download_dialog = dialog
+        dialog.refresh_states()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    window.models_requested.connect(show_models)
     app.aboutToQuit.connect(controller.shutdown)
     if error:
         window.show_error(error)

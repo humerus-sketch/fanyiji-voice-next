@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "app=%~dp0dist\0.5.2-voice\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
+set "app=%~dp0dist\0.5.2-external-models-r3\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
 set "profile=%~dp0settings\voice.settings.json"
 if not exist "%app%" (
   echo FanyiJiVoiceNext executable was not found. Keep the complete project folder.
@@ -13,4 +13,4 @@ if not exist "%profile%" (
   pause
   exit /b 1
 )
-start "" "%app%" --model-root "%~dp0models" --settings-file "%profile%" --require-settings
+start "" "%app%" --settings-file "%profile%" --require-settings

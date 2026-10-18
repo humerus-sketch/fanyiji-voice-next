@@ -308,3 +308,151 @@ def test_gpu_records_outside_declared_namespace_are_not_collected(builder, tmp_p
     binaries = builder.nvidia_binaries()
     assert len(binaries) == 5
     assert all(source.name != "private.dll" for source, _destination in binaries)
+
+
+def test_ab_build_explicitly_collects_runtime_without_model_data(builder, tmp_path, fake_gpu_wheels, monkeypatch):
+    monkeypatch.setattr(builder, "ab_runtime_metadata", lambda: {name: "test" for name in builder.AB_DISTRIBUTIONS})
+    command = builder.build_command(tmp_path / "dist", tmp_path / "work", "voice", True)
+    submodules = {command[i + 1] for i, value in enumerate(command) if value == "--collect-submodules"}
+    metadata = {command[i + 1] for i, value in enumerate(command) if value == "--copy-metadata"}
+    assert set(builder.AB_MODULES) <= submodules
+    assert set(builder.AB_DISTRIBUTIONS) <= metadata
+    assert "--collect-data" not in command
+    collected_all = {command[i + 1] for i, value in enumerate(command) if value == "--collect-all"}
+    assert not collected_all.intersection(builder.AB_MODULES)
+    assert set(builder.AB_DISTRIBUTIONS) <= set(builder.license_packages("voice", True))
+
+
+def test_explicit_ab_build_fails_when_dependency_is_missing(builder, tmp_path, fake_gpu_wheels, monkeypatch):
+    def missing():
+        raise builder.importlib.metadata.PackageNotFoundError("torch")
+    monkeypatch.setattr(builder, "ab_runtime_metadata", missing)
+    with pytest.raises(builder.importlib.metadata.PackageNotFoundError):
+        builder.build_command(tmp_path / "dist", tmp_path / "work", "voice", True)
+    assert not (tmp_path / "dist").exists()
+
+
+def test_ab_engines_not_silently_enabled_for_regular_build(builder, tmp_path, fake_gpu_wheels, monkeypatch):
+    monkeypatch.setattr(builder, "ab_runtime_metadata", lambda: pytest.fail("regular build must not claim A/B dependencies"))
+    builder.build_command(tmp_path / "dist", tmp_path / "work", "voice")
+    with pytest.raises(ValueError, match="语音版"):
+        builder.build_command(tmp_path / "dist", tmp_path / "work", "prototype", True)
+
+
+@pytest.mark.parametrize("relative", ["FanyiJiVoiceNext_models/catalog.json", "字幕_MODELS/model.json",
+                                      "_internal/data/arbitrary.bin", "_internal/data/model.safetensors",
+                                      "_internal/faster_whisper/assets/vad.onnx"])
+def test_payload_rejects_any_model_directory_or_weight_suffix(builder, tmp_path, relative):
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"fixture")
+    with pytest.raises(RuntimeError, match="模型或用户资料"):
+        builder.assert_public_payload(tmp_path)
+
+
+def test_payload_allows_exact_sentencepiece_runtime_tables(builder, tmp_path):
+    for relative in builder.NORMALIZATION_TABLES:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"unicode runtime table fixture")
+    builder.assert_public_payload(tmp_path)
+
+
+@pytest.mark.parametrize("package", ["ctranslate2", "transformers", "funasr", "torchaudio", "torchaudio/prototype"])
+def test_external_runtime_models_code_still_cannot_hide_weights(builder, tmp_path, package):
+    target = tmp_path / "_internal" / package / "models/qwen3_asr/modeling.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("# public runtime implementation", encoding="utf-8")
+    builder.assert_public_payload(tmp_path)
+    (target.parent / "model.safetensors").write_bytes(b"weight must fail")
+    with pytest.raises(RuntimeError, match="模型或用户资料"):
+        builder.assert_public_payload(tmp_path)
+
+
+def test_ab_runtime_copies_only_server_dlls_notices_and_vc_fallbacks(builder, tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "ROOT", tmp_path)
+    source = tmp_path / "runtime/llama-b11696-cuda12.4"
+    source.mkdir(parents=True)
+    for name in ("llama-server.exe", "llama.dll", "ggml-cuda.dll", "LICENSE-LLVM-OpenMP", "llama-quantize.exe", "test-model.gguf"):
+        (source / name).write_bytes(name.encode())
+    folder = tmp_path / "program"
+    (folder / "_internal").mkdir(parents=True)
+    for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        (folder / "_internal" / name).write_bytes(("canonical " + name).encode())
+    builder.collect_llama_runtime(folder)
+    destination = folder / "runtime/llama-b11696-cuda12.4"
+    assert {p.name for p in destination.iterdir()} == {"llama-server.exe", "llama.dll", "ggml-cuda.dll", "LICENSE-LLVM-OpenMP",
+                                                     "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"}
+    for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        assert (destination / name).read_bytes() == ("canonical " + name).encode()
+    builder.assert_public_payload(folder)
+    with pytest.raises(RuntimeError, match="已存在"):
+        builder.collect_llama_runtime(folder)
+
+
+def test_ab_runtime_missing_server_fails_without_partial_destination(builder, tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "ROOT", tmp_path)
+    (tmp_path / "runtime/llama-b11696-cuda12.4").mkdir(parents=True)
+    folder = tmp_path / "program"
+    with pytest.raises(RuntimeError, match="llama-server"):
+        builder.collect_llama_runtime(folder)
+    assert not folder.exists()
+
+
+def test_vendored_aliyun_certifi_allows_only_exact_matching_public_bundle(builder, tmp_path):
+    import certifi
+    relative = "_internal/aliyunsdkcore/vendored/requests/packages/certifi/cacert.pem"
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(Path(certifi.where()).read_bytes())
+    builder.assert_public_payload(tmp_path)
+    target.write_bytes(target.read_bytes() + b"# changed")
+    with pytest.raises(RuntimeError, match="模型或用户资料"):
+        builder.assert_public_payload(tmp_path)
+    target.write_bytes(b"-----BEGIN PRIVATE KEY-----")
+    with pytest.raises(RuntimeError, match="模型或用户资料"):
+        builder.assert_public_payload(tmp_path)
+
+
+def test_ab_build_uses_precise_funasr_source_and_version_hook(builder, tmp_path, fake_gpu_wheels, monkeypatch):
+    monkeypatch.setattr(builder, "ab_runtime_metadata", lambda: {name: "fixture" for name in builder.AB_DISTRIBUTIONS})
+    command = builder.build_command(tmp_path / "dist", tmp_path / "work", "voice", True)
+    hook = Path(command[command.index("--additional-hooks-dir") + 1]) / "hook-funasr.py"
+    assert hook.is_file()
+    import ast
+    tree = ast.parse(hook.read_text(encoding="utf-8"))
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "collect_data_files")
+    options = {item.arg: ast.literal_eval(item.value) for item in call.keywords}
+    assert options == {"include_py_files": True, "includes": ["*.py", "**/*.py", "version.txt"]}
+
+
+def test_frozen_payload_cannot_shadow_system_icu(builder, tmp_path):
+    target = tmp_path / "_internal/icuuc.dll"
+    target.parent.mkdir()
+    target.write_bytes(b"unrelated tool ICU would break Qt")
+    with pytest.raises(RuntimeError, match="系统 ICU"):
+        builder.assert_public_payload(tmp_path)
+
+
+@pytest.mark.parametrize("relative", [
+    "_internal/jieba/lac_small/model_baseline/word_emb",
+    "_internal/jieba/lac_small/model_baseline/crfw",
+    "_internal/jieba/lac_small/MODEL_BASELINE/arbitrary",
+    "_internal/torch/__pycache__/__init__.cpython-312.pyc",
+])
+def test_frozen_payload_rejects_hidden_checkpoint_and_import_cache(builder, tmp_path, relative):
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"not standalone runtime code")
+    with pytest.raises(RuntimeError, match="模型或用户资料"):
+        builder.assert_public_payload(tmp_path)
+
+
+def test_ab_build_hook_excludes_jieba_paddle_checkpoint_but_keeps_dictionary_collection(builder):
+    import ast
+    hook = builder.ROOT / "tools/pyinstaller_hooks/hook-jieba.py"
+    call = next(node for node in ast.walk(ast.parse(hook.read_text(encoding="utf-8")))
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "collect_data_files")
+    assert ast.literal_eval(call.args[0]) == "jieba"
+    options = {item.arg: ast.literal_eval(item.value) for item in call.keywords}
+    assert options == {"excludes": ["lac_small/model_baseline", "lac_small/model_baseline/**", "**/__pycache__/**"]}

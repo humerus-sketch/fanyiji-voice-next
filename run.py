@@ -13,6 +13,10 @@ def launch():
             sys.argv.remove("--prototype")
             from fanyiji_next.prototype import main
         else:
+            from fanyiji_next.runtime_bootstrap import run_runtime_bootstrap_if_needed
+            result = run_runtime_bootstrap_if_needed(sys.argv[1:])
+            if result is not None:
+                return result
             from fanyiji_next.app import main
         return main()
     except Exception:

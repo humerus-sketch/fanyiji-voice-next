@@ -216,3 +216,36 @@ def test_executable_is_included_even_when_unchanged(patcher, inputs):
     (inputs["program_folder"] / "FanyiJiVoiceNext.exe").write_bytes(b"MZ old program")
     result = patcher.package_patch(**inputs)
     assert "FanyiJiVoiceNext.exe" in {row["path"] for row in result["included_program_files"]}
+
+
+@pytest.mark.parametrize("directory", ["FanyiJiVoiceNext_models", "直播字幕_models", "custom_MODELS"])
+def test_patch_preserves_downloaded_model_root_without_reading_weights(patcher, inputs, tmp_path, monkeypatch, directory):
+    write_files(inputs["baseline_folder"], {directory + "/speech/model.safetensors": b"downloaded weight"})
+    save_baseline_manifest(patcher, inputs)
+    original = patcher.release.sha256
+
+    def no_model_reads(path):
+        assert not any(part.casefold().endswith("_models") for part in Path(path).parts)
+        return original(path)
+
+    monkeypatch.setattr(patcher.release, "sha256", no_model_reads)
+    result = patcher.package_patch(**inputs)
+    assert result["preserved_model_file_count"] == 2
+    installed = tmp_path / "installed-external"
+    shutil.copytree(inputs["baseline_folder"], installed)
+    item = result["program_update"]
+    info = updater.UpdateInfo("0.5.1", item["name"], item["url"], item["sha256"], item["size"],
+                              "https://github.com/example/voice-next/releases/tag/v0.5.1", "patch")
+    prepared = updater.UpdateClient(repository="example/voice-next", cache_dir=tmp_path / "cache").prepare(
+        updater.DownloadedUpdate(info, inputs["output"] / item["name"]), installed)
+    updater.apply_update(prepared.job_path, restart=False)
+    assert (installed / directory / "speech/model.safetensors").read_bytes() == b"downloaded weight"
+
+
+@pytest.mark.parametrize("relative", ["FanyiJiVoiceNext_models/catalog.json", "_internal/data/model.bin",
+                                      "_internal/data/vad.onnx", "_internal/data/weight.safetensors"])
+def test_new_overlay_cannot_inject_external_models(patcher, inputs, relative):
+    write_files(inputs["program_folder"], {relative: b"must be rejected"})
+    with pytest.raises((ValueError, updater.UpdateError)):
+        patcher.package_patch(**inputs)
+    assert not inputs["output"].exists()

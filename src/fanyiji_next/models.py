@@ -43,6 +43,11 @@ class AppSettings:
     mdx_model_file: str = ""
     gtcrn_model_file: str = ""
     window_transparency_enabled: bool = True
+    model_combination: str = "A"
+    external_model_root: str = ""
+    qwen_asr_model_dir: str = ""
+    fun_asr_model_dir: str = ""
+    gemma_model_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,8 @@ class RuntimeEvent:
     translation_ms: int = 0
     end_reason: str = ""
     speech_detector: str = ""
+    source_language: str = ""
+    target_language: str = ""
 
 
 @dataclass

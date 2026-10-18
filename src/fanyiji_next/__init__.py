@@ -1,3 +1,3 @@
 """A standalone voice subtitle application, with no legacy application imports."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"

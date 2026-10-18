@@ -19,6 +19,17 @@ def settle(app):
         app.processEvents()
 
 
+def test_error_notice_has_three_second_timer_and_duplicates_do_not_extend_it(window):
+    widget, app = window
+    widget.show_error("设备错误")
+    assert widget.notice.isVisible() and widget._error_timer.interval() == 3000
+    remaining = widget._error_timer.remainingTime()
+    widget.show_error("设备错误")
+    assert widget._error_timer.remainingTime() <= remaining
+    widget._error_timer.timeout.emit()
+    assert not widget.notice.isVisible()
+
+
 @pytest.fixture
 def window():
     app = QApplication.instance() or QApplication([])

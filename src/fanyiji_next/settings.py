@@ -16,14 +16,48 @@ SCHEMA_VERSION = 1
 _DIRECTIONS = {"zh_to_ja", "ja_to_zh"}
 _PATH_FIELDS = ("asr_model", "asr_tokens", "translation_model_dir", "translation_spm",
                 "whisper_model_dir", "nllb_model_dir", "nllb_tokenizer_dir",
-                "hymt_model_file", "hymt_server_exe", "vad_model", "mdx_model_file", "gtcrn_model_file")
-_BACKENDS = {"recognition_backend": {"sensevoice", "whisper"},
-             "translation_backend": {"m2m100", "nllb", "hymt"},
+                "hymt_model_file", "hymt_server_exe", "vad_model", "mdx_model_file", "gtcrn_model_file",
+                "external_model_root", "qwen_asr_model_dir", "fun_asr_model_dir", "gemma_model_file")
+_BACKENDS = {"recognition_backend": {"sensevoice", "whisper", "qwen3_asr", "fun_asr"},
+             "translation_backend": {"m2m100", "nllb", "hymt", "translategemma"},
              "system_audio_processing": {"raw", "gtcrn", "gtcrn_preserve", "mdx", "mdx_gtcrn"}}
 
 
 class SettingsError(ValueError):
     """The configuration is unreadable or contains an invalid value."""
+
+
+def selected_model_combination(settings: AppSettings) -> str:
+    """Recover older UI saves that changed the backend but omitted the pair."""
+    return {"qwen3_asr": "A", "fun_asr": "B"}.get(settings.recognition_backend, settings.model_combination)
+
+
+def with_model_combination(settings: AppSettings, combination: str, root: Path) -> AppSettings:
+    """Bind one supported pair to the current EXE's external weight directory."""
+    from .model_catalog import MODEL_CATALOG, MODEL_COMBINATIONS
+    from .model_paths import bundled_llama_server
+
+    if combination not in MODEL_COMBINATIONS:
+        raise SettingsError("模型方案必须是 A 或 B。")
+    folder = Path(root).absolute()
+    models = [MODEL_CATALOG[key] for key in MODEL_COMBINATIONS[combination]]
+    asr, gemma = models[:2]
+    server = bundled_llama_server()
+    # A source checkout can keep the already installed, matching llama runtime.
+    if not server.is_file() and settings.hymt_server_exe:
+        server = Path(settings.hymt_server_exe)
+    return replace(settings, model_combination=combination, external_model_root=str(folder),
+                   recognition_backend="qwen3_asr" if combination == "A" else "fun_asr",
+                   translation_backend="translategemma", system_audio_processing="raw",
+                   qwen_asr_model_dir=str(folder / asr.directory_name) if combination == "A" else "",
+                   fun_asr_model_dir=str(folder / asr.directory_name) if combination == "B" else "",
+                   gemma_model_file=str(folder / gemma.directory_name / gemma.files[0].relative_path),
+                   vad_model=str(folder / "silero-vad-onnx" / "silero_vad.onnx"),
+                   hymt_server_exe=str(server), asr_model="", asr_tokens="",
+                   translation_model_dir="", translation_spm="", whisper_model_dir="",
+                   nllb_model_dir="", nllb_tokenizer_dir="", hymt_model_file="",
+                   mdx_model_file="", gtcrn_model_file="",
+                   recognition_compute_type="bfloat16", translation_compute_type="int8")
 
 
 def settings_path() -> Path:
@@ -84,6 +118,8 @@ def validate_settings(settings: AppSettings) -> None:
         raise SettingsError("settings must be AppSettings")
     _validate_channel(settings.microphone, "microphone")
     _validate_channel(settings.system, "system")
+    if settings.model_combination not in {"A", "B"}:
+        raise SettingsError("model_combination must be A or B")
     for name in _PATH_FIELDS:
         value = getattr(settings, name)
         if not isinstance(value, str) or "\x00" in value:
@@ -97,8 +133,8 @@ def validate_settings(settings: AppSettings) -> None:
         compute = getattr(settings, role + "_compute_type")
         if not isinstance(device, str) or device not in {"cpu", "cuda"}:
             raise SettingsError(f"{role}_device must be cpu or cuda")
-        if not isinstance(compute, str) or compute not in {"int8", "int8_float16", "float16"}:
-            raise SettingsError(f"{role}_compute_type must be int8, int8_float16 or float16")
+        if not isinstance(compute, str) or compute not in {"int8", "int8_float16", "float16", "bfloat16"}:
+            raise SettingsError(f"{role}_compute_type must be int8, int8_float16, float16 or bfloat16")
         # The shared translation device/precision fields configure CTranslate2.
         # Hy-MT2 uses its GGUF quantization and a CUDA-only local runtime.
         active = (settings.translation_backend in {"m2m100", "nllb"} if role == "translation"

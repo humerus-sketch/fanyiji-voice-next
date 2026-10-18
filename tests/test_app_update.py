@@ -10,6 +10,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import threading
 from urllib.request import Request
 import zipfile
 
@@ -416,7 +417,7 @@ def test_second_helper_for_same_installation_is_rejected_across_processes(tmp_pa
     environment["PYTHONPATH"] = str(Path(update.__file__).resolve().parents[1])
     with update._installation_lock(prepared.install_dir):
         completed = subprocess.run([sys.executable, "-X", "utf8", "-B", "-c", script, str(prepared.job_path)],
-                                   env=environment, capture_output=True, text=True, timeout=15)
+                                   env=environment, capture_output=True, text=True, encoding="utf-8", timeout=15)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "另一更新助手" in completed.stdout
     assert (prepared.install_dir / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
@@ -424,3 +425,388 @@ def test_second_helper_for_same_installation_is_rejected_across_processes(tmp_pa
     # The first helper releases its lock without leaving a stale lock owner.
     update.apply_update(prepared.job_path, restart=False)
     assert (prepared.install_dir / "FanyiJiVoiceNext.exe").read_bytes() == b"new executable"
+
+
+@pytest.mark.parametrize("bad_path", [
+    "FanyiJiVoiceNext_models/catalog.json", "字幕_models/speech/model.py", "Renamed_MODELS/file.dll",
+    "_internal/any_models/catalog.json", "runtime/直播_models/config.json",
+    "_internal/transformers/models/user_models/modeling.py", "_internal/funasr/models/saved_MODELS/entry.py",
+    "_internal/ctranslate2/models/extra_models/dependency.py",
+])
+def test_external_model_suffix_is_protected_at_every_depth(tmp_path, bad_path):
+    downloaded = archive(tmp_path, {"FanyiJiVoiceNext.exe": b"new", bad_path: b"bad"})
+    install = installation(tmp_path)
+    with pytest.raises(update.UpdateError, match="模型"):
+        client(tmp_path).prepare(downloaded, install)
+    assert (install / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+
+
+@pytest.mark.parametrize("suffix", [".onnx", ".gguf", ".safetensors", ".pt", ".pth", ".ckpt", ".tflite", ".bin", ".model"])
+def test_any_weight_name_or_case_is_rejected_even_outside_models(suffix):
+    with pytest.raises(update.UpdateError, match="模型"):
+        update._safe_path("_internal/runtime/innocent" + suffix.upper())
+
+
+@pytest.mark.parametrize("package", ["ctranslate2", "transformers", "funasr", "torchaudio", "torchaudio/prototype"])
+@pytest.mark.parametrize("suffix", [".py", ".pyc", ".pyd"])
+def test_dependency_models_permits_only_code_in_exact_prefix(tmp_path, package, suffix):
+    relative = f"_internal/{package}/models/qwen3_asr/implementation{suffix}"
+    prepared = client(tmp_path).prepare(archive(tmp_path, {"FanyiJiVoiceNext.exe": b"new", relative: b"# public dependency"}),
+                                        installation(tmp_path))
+    assert (prepared.cache_dir / "staged" / relative).read_bytes() == b"# public dependency"
+    for name in ("config.json", "model.bin", "model.safetensors", "weights.onnx", "runtime.dll", "untyped"):
+        with pytest.raises(update.UpdateError, match="模型"):
+            update._safe_path(f"_internal/{package}/models/qwen3_asr/{name}")
+    with pytest.raises(update.UpdateError, match="模型"):
+        update._safe_path(f"_internal/not-{package}/models/implementation.py")
+
+
+def test_dependency_nested_directory_entries_are_valid_but_not_manifest_files(tmp_path):
+    relative = "_internal/transformers/models/qwen3_asr/modeling.py"
+    downloaded = archive(tmp_path, {"FanyiJiVoiceNext.exe": b"new", relative: b"# source"},
+                         extra={"_internal/transformers/models/": b"", "_internal/transformers/models/qwen3_asr/": b""})
+    prepared = client(tmp_path).prepare(downloaded, installation(tmp_path))
+    assert (prepared.cache_dir / "staged" / relative).is_file()
+    with pytest.raises(update.UpdateError, match="模型"):
+        update._safe_path("_internal/transformers/models/qwen3_asr")
+
+
+def test_exact_sentencepiece_tables_are_runtime_data_and_cannot_allow_other_bins(tmp_path):
+    files = {"FanyiJiVoiceNext.exe": b"new"}
+    files.update({path: b"Unicode normalization runtime data" for path in update._NORMALIZATION_TABLES})
+    prepared = client(tmp_path).prepare(archive(tmp_path, files), installation(tmp_path))
+    for relative in update._NORMALIZATION_TABLES:
+        assert (prepared.cache_dir / "staged" / relative).read_bytes() == b"Unicode normalization runtime data"
+    for path in ("_internal/sentencepiece/package_data/weights.bin", "_internal/vendor/nfkc.bin",
+                 "_internal/sentencepiece/package_data/nfkc.BIN", "runtime/nfkc.bin"):
+        with pytest.raises(update.UpdateError, match="模型"):
+            update._safe_path(path)
+
+
+@pytest.mark.parametrize("restart_fails", [False, True])
+def test_install_success_and_rollback_preserve_external_models_and_user_settings(tmp_path, restart_fails):
+    install = installation(tmp_path)
+    weights = {}
+    for directory in ("FanyiJiVoiceNext_models", "直播字幕_models", "Another_MODELS"):
+        relative = directory + "/speech/model.safetensors"
+        target = install / relative
+        target.parent.mkdir(parents=True)
+        weights[relative] = ("original " + directory).encode()
+        target.write_bytes(weights[relative])
+    prepared = client(tmp_path).prepare(archive(tmp_path), install)
+    def start(*args, **kwargs):
+        if restart_fails:
+            raise OSError("simulated restart error")
+    if restart_fails:
+        with pytest.raises(update.UpdateError, match="已恢复原程序"):
+            update.apply_update(prepared.job_path, start=start)
+        assert (install / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+    else:
+        update.apply_update(prepared.job_path, start=start)
+        assert (install / "FanyiJiVoiceNext.exe").read_bytes() == b"new executable"
+    for relative, content in weights.items():
+        assert (install / relative).read_bytes() == content
+        assert not (prepared.cache_dir / "backup" / relative).exists()
+    assert (install / "settings/voice.settings.json").read_bytes() == b"user settings"
+    assert (install / "models/model.gguf").read_bytes() == b"user model"
+
+
+def test_shipped_torch_heuristic_code_can_be_prepared_and_installed(tmp_path):
+    names = ("__init__", "_MixedMMA100", "_MixedMMH100", "_MMRankingA100", "_MMRankingH100", "_PadMMA100")
+    directory = "_internal/torch/_inductor/autoheuristic/artifacts"
+    files = {"FanyiJiVoiceNext.exe": b"new executable"}
+    files.update({f"{directory}/{name}.py": ("# torch heuristic " + name).encode() for name in names})
+    downloaded = archive(tmp_path, files, extra={directory + "/": b""})
+    install = installation(tmp_path)
+    prepared = client(tmp_path).prepare(downloaded, install)
+    update.apply_update(prepared.job_path, restart=False)
+    for relative, content in files.items():
+        assert (install / relative).read_bytes() == content
+    assert (install / "models/model.gguf").read_bytes() == b"user model"
+    assert (install / "settings/voice.settings.json").read_bytes() == b"user settings"
+
+
+@pytest.mark.parametrize("relative", [
+    "artifacts/_MMRankingA100.py", "_internal/other/artifacts/_MMRankingA100.py",
+    "_internal/torch/_inductor/autoheuristic/artifacts/private.py",
+    "_internal/torch/_inductor/autoheuristic/artifacts/_MMRankingA100.pyc",
+    "_internal/torch/_inductor/autoheuristic/artifacts/_MMRankingA100.pyd",
+    "_internal/torch/_inductor/autoheuristic/artifacts/model.gguf",
+    "_internal/torch/_inductor/autoheuristic/artifacts/model.safetensors",
+    "_internal/torch/_inductor/autoheuristic/artifacts/nested/_MMRankingA100.py",
+    "_internal/torch/_inductor/autoheuristic/artifacts/settings.json",
+])
+def test_torch_artifacts_exception_rejects_other_files_without_install(tmp_path, relative):
+    install = installation(tmp_path)
+    downloaded = archive(tmp_path, {"FanyiJiVoiceNext.exe": b"new", relative: b"excluded"})
+    with pytest.raises(update.UpdateError):
+        client(tmp_path).prepare(downloaded, install)
+    assert (install / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+
+
+@pytest.mark.parametrize("relative", [
+    "artifacts", "_internal/other/artifacts",
+    "_internal/torch/_inductor/autoheuristic/artifacts/nested",
+    "_internal/torch/_inductor/autoheuristic/artifacts/_MMRankingA100.py",
+])
+def test_torch_artifacts_exception_does_not_allow_unlisted_directories(relative):
+    with pytest.raises(update.UpdateError):
+        update._safe_path(relative, directory=True)
+
+
+def runtime_descriptor(body, *, count=3):
+    chunks = [body[index * len(body) // count:(index + 1) * len(body) // count] for index in range(count)]
+    parts = [{"name": f"runtime.zip.{index:03d}", "url": URL.replace("program.zip", f"runtime.zip.{index:03d}"),
+              "size": len(chunk), "sha256": hashlib.sha256(chunk).hexdigest()}
+             for index, chunk in enumerate(chunks, 1)]
+    descriptor = {"schema_version": 1, "application": update.APPLICATION, "platform": update.PLATFORM,
+                  "kind": "runtime-bundle", "version": VERSION, "build_id": "voice-ab-test-r1",
+                  "name": "runtime.zip", "size": len(body), "sha256": hashlib.sha256(body).hexdigest(), "parts": parts}
+    return descriptor, dict(zip((part["url"] for part in parts), chunks))
+
+
+class RuntimeResponse(Response):
+    def __init__(self, body, *, offset=0, total=None, status=None):
+        super().__init__(body, len(body))
+        self.status = status if status is not None else (206 if offset else 200)
+        if self.status == 206:
+            self.headers["Content-Range"] = f"bytes {offset}-{(total or len(body)) - 1}/{total or len(body)}"
+
+
+def runtime_network(monkeypatch, bodies, calls=None):
+    def open_part(self, url, **kwargs):
+        headers = kwargs.get("headers", {})
+        if calls is not None:
+            calls.append((url, dict(headers)))
+        offset = int(headers.get("Range", "bytes=0-")[6:-1])
+        return RuntimeResponse(bodies[url][offset:], offset=offset, total=len(bodies[url]))
+    monkeypatch.setattr(update.UpdateClient, "_open", open_part)
+
+
+def test_runtime_bundle_download_order_hash_cache_and_progress(monkeypatch, tmp_path):
+    body = b"first second third" * 30000
+    descriptor, bodies = runtime_descriptor(body)
+    calls, observed = [], []
+    runtime_network(monkeypatch, bodies, calls)
+    downloaded = update.download_runtime_bundle(descriptor, tmp_path / "downloads", lambda *row: observed.append(row), repository=REPOSITORY)
+    assert downloaded.archive_path.read_bytes() == body
+    assert downloaded.descriptor.build_id == descriptor["build_id"]
+    assert [url for url, _ in calls] == list(bodies)
+    assert observed[-1] == (len(body), len(body))
+    assert update.parse_runtime_bundle_descriptor(downloaded.descriptor, repository=REPOSITORY).as_dict() == descriptor
+    calls.clear()
+    assert update.download_runtime_bundle(descriptor, tmp_path / "downloads", repository=REPOSITORY) == downloaded
+    assert not calls
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.update(extra=True), lambda d: d.update(schema_version=True), lambda d: d.update(application="other"),
+    lambda d: d.update(platform="linux"), lambda d: d.update(kind="program"), lambda d: d.update(version="latest"),
+    lambda d: d.update(build_id="../outside"), lambda d: d.update(name="../runtime.zip"),
+    lambda d: d.update(size=update.MAX_RUNTIME_DOWNLOAD_BYTES + 1), lambda d: d.update(sha256="A" * 64),
+    lambda d: d.update(size=d["size"] + 1), lambda d: d["parts"][0].update(size=update.MAX_DOWNLOAD_BYTES),
+    lambda d: d["parts"][0].update(sha256="invalid"),
+    lambda d: d["parts"][0].update(url=d["parts"][0]["url"].replace("/v0.5.0/", "/v0.4.8/")),
+    lambda d: d["parts"][0].update(url=d["parts"][0]["url"].replace(REPOSITORY, "other/repository")),
+    lambda d: d["parts"][0].update(url=d["parts"][0]["url"] + "?token=SECRET"),
+    lambda d: d["parts"][0].update(url=d["parts"][0]["url"].replace("https://github.com", "https://@github.com")),
+    lambda d: d["parts"][0].update(url=d["parts"][1]["url"]),
+    lambda d: d["parts"].append(dict(d["parts"][0])), lambda d: d.update(parts=[]),
+])
+def test_runtime_descriptor_is_strict_and_bound_to_repo_version_asset(mutate):
+    descriptor, _ = runtime_descriptor(b"abcdefghij")
+    mutate(descriptor)
+    with pytest.raises(update.UpdateError):
+        update.parse_runtime_bundle_descriptor(descriptor, repository=REPOSITORY)
+
+
+def test_runtime_partial_interruption_retries_with_range(monkeypatch, tmp_path):
+    body = b"abcdefgh" * 50000
+    descriptor, bodies = runtime_descriptor(body, count=1)
+    calls = []
+    class Interrupted(RuntimeResponse):
+        def read(self, size=-1):
+            if self.tell():
+                raise OSError("injected connection reset")
+            return super().read(size)
+    def open_part(self, url, **kwargs):
+        headers = kwargs["headers"]
+        calls.append(dict(headers))
+        offset = int(headers.get("Range", "bytes=0-")[6:-1])
+        return (Interrupted(body) if len(calls) == 1
+                else RuntimeResponse(body[offset:],offset=offset,total=len(body)))
+    monkeypatch.setattr(update.UpdateClient, "_open", open_part)
+    result = update.download_runtime_bundle(descriptor, tmp_path, repository=REPOSITORY)
+    assert result.archive_path.read_bytes() == body
+    assert "Range" not in calls[0]
+    assert calls[1]["Range"] == "bytes=262144-"
+
+
+def test_runtime_cancel_preserves_verified_parts_and_resumes_other_part(monkeypatch, tmp_path):
+    body = b"abcdefgh" * 100000
+    descriptor, bodies = runtime_descriptor(body, count=2)
+    calls, event = [], threading.Event()
+    runtime_network(monkeypatch, bodies, calls)
+    first_size = descriptor["parts"][0]["size"]
+    def cancel_after_second_prefix(done, total):
+        if first_size < done < total:
+            event.set()
+    with pytest.raises(update.UpdateCancelled):
+        update.download_runtime_bundle(descriptor, tmp_path, cancel_after_second_prefix, event, repository=REPOSITORY)
+    assert len(list(tmp_path.glob("runtime-*/part-000.verified"))) == 1
+    assert len(list(tmp_path.glob("runtime-*/part-001.verified.part"))) == 1
+    event.clear()
+    calls.clear()
+    result = update.download_runtime_bundle(descriptor,tmp_path,cancel_event=event,repository=REPOSITORY)
+    assert result.archive_path.read_bytes() == body
+    assert len(calls) == 1 and calls[0][1]["Range"] == "bytes=262144-"
+
+
+def test_runtime_bad_sha_is_quarantined_and_clean_retry_succeeds(monkeypatch, tmp_path):
+    body = b"correct bytes"
+    descriptor, _ = runtime_descriptor(body, count=1)
+    calls = []
+    def open_part(self, url, **kwargs):
+        calls.append(kwargs)
+        return RuntimeResponse(b"!" * len(body) if len(calls) == 1 else body)
+    monkeypatch.setattr(update.UpdateClient, "_open", open_part)
+    result = update.download_runtime_bundle(descriptor, tmp_path, repository=REPOSITORY)
+    assert result.archive_path.read_bytes() == body
+    assert len(calls) == 2 and all("Range" not in call["headers"] for call in calls)
+    assert [path.read_bytes() for path in tmp_path.glob("runtime-*/*.bad-*")] == [b"!" * len(body)]
+
+
+@pytest.mark.parametrize("ignore_range", [True, False])
+def test_runtime_range_response_cannot_append_wrong_bytes(monkeypatch, tmp_path, ignore_range):
+    body = b"correct bytes" * 30000
+    descriptor, _ = runtime_descriptor(body, count=1)
+    event = threading.Event()
+    runtime_network(monkeypatch, {descriptor["parts"][0]["url"]:body})
+    with pytest.raises(update.UpdateCancelled):
+        update.download_runtime_bundle(descriptor,tmp_path,lambda *_:event.set(),event,repository=REPOSITORY)
+    part = next(tmp_path.glob("runtime-*/*.part"))
+    part.write_bytes(b"wrong")
+    def open_part(self,url,**kwargs):
+        assert kwargs["headers"]["Range"] == "bytes=5-"
+        response = RuntimeResponse(body,status=200 if ignore_range else 206)
+        if not ignore_range:
+            response.headers["Content-Range"] = f"bytes 0-{len(body)-1}/{len(body)}"
+        return response
+    monkeypatch.setattr(update.UpdateClient,"_open",open_part)
+    if ignore_range:
+        assert update.download_runtime_bundle(descriptor,tmp_path,repository=REPOSITORY).archive_path.read_bytes() == body
+    else:
+        with pytest.raises(update.UpdateError):
+            update.download_runtime_bundle(descriptor,tmp_path,repository=REPOSITORY)
+        assert part.read_bytes() == b"wrong"
+
+
+def test_runtime_full_merge_sha_blocks_incorrect_part_order(monkeypatch, tmp_path):
+    body = b"111122223333"
+    descriptor,bodies = runtime_descriptor(body)
+    descriptor["parts"] = list(reversed(descriptor["parts"]))
+    runtime_network(monkeypatch,bodies)
+    with pytest.raises(update.UpdateError,match="合并 SHA256"):
+        update.download_runtime_bundle(descriptor,tmp_path,repository=REPOSITORY)
+    assert not list(tmp_path.glob("runtime-*/runtime.zip"))
+
+
+def test_runtime_cache_hardlink_rejected_without_modifying_external_file(monkeypatch,tmp_path):
+    body = b"correct bytes"
+    descriptor,bodies = runtime_descriptor(body,count=1)
+    runtime_network(monkeypatch,bodies)
+    downloaded = update.download_runtime_bundle(descriptor,tmp_path / "cache",repository=REPOSITORY)
+    outside = tmp_path / "outside"
+    os.link(downloaded.archive_path,outside)
+    with pytest.raises(update.UpdateError,match="普通文件"):
+        update.download_runtime_bundle(descriptor,tmp_path / "cache",repository=REPOSITORY)
+    assert outside.read_bytes() == body
+
+
+@pytest.mark.parametrize("ready_build", [None,"wrong-build","voice-ab-test-r1"])
+def test_runtime_prepare_checks_build_marker_and_preserves_user_data(monkeypatch,tmp_path,ready_build):
+    files = {"FanyiJiVoiceNext.exe":b"new runtime executable","_internal/library.dll":b"new runtime library"}
+    if ready_build:
+        files["_updater/runtime-ready.json"] = json.dumps({"schema_version":1,"application":update.APPLICATION,
+                                                        "version":VERSION,"build_id":ready_build}).encode()
+    package = archive(tmp_path,files)
+    descriptor,bodies = runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch,bodies)
+    downloaded = update.download_runtime_bundle(descriptor,tmp_path / "downloads",repository=REPOSITORY)
+    install = installation(tmp_path)
+    if ready_build != "voice-ab-test-r1":
+        with pytest.raises(update.UpdateError,match="标识|runtime-ready"):
+            update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
+        assert not list(downloaded.archive_path.parent.glob("prepare/install-*/job.json"))
+    else:
+        prepared = update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
+        assert prepared.version == VERSION
+        backup = update.apply_update(prepared.job_path,restart=False)
+        assert (backup / "FanyiJiVoiceNext.exe").read_bytes() == b"old executable"
+        assert (install / "FanyiJiVoiceNext.exe").read_bytes() == files["FanyiJiVoiceNext.exe"]
+    assert (install / "models/model.gguf").read_bytes() == b"user model"
+    assert (install / "settings/voice.settings.json").read_bytes() == b"user settings"
+
+
+@pytest.mark.parametrize("path", ["_internal/jieba/lac_small/model_baseline/params",
+    "_internal/Jieba/LAC_SMALL/model_baseline/model", "_internal/example/__pycache__/module.pyc"])
+def test_hidden_dependency_weights_and_generated_cache_are_rejected(tmp_path,path):
+    package = archive(tmp_path,{"FanyiJiVoiceNext.exe":b"new",path:b"hidden weight or generated cache"})
+    with pytest.raises(update.UpdateError):
+        client(tmp_path).prepare(package,installation(tmp_path))
+
+
+def test_runtime_cancel_before_network_and_disk_error_do_not_retry(monkeypatch,tmp_path):
+    descriptor,bodies = runtime_descriptor(b"correct bytes",count=1)
+    calls = []
+    runtime_network(monkeypatch,bodies,calls)
+    event = threading.Event()
+    event.set()
+    with pytest.raises(update.UpdateCancelled):
+        update.download_runtime_bundle(descriptor,tmp_path,cancel_event=event,repository=REPOSITORY)
+    assert not calls and not list(tmp_path.iterdir())
+    event.clear()
+    monkeypatch.setattr(update.os,"fsync",lambda _: (_ for _ in ()).throw(OSError("injected disk failure")))
+    with pytest.raises(update.UpdateError,match="缓存读写"):
+        update.download_runtime_bundle(descriptor,tmp_path,repository=REPOSITORY)
+    assert len(calls)==1 and not list(tmp_path.glob("runtime-*/*.verified"))
+
+
+def test_runtime_part_mutation_during_merge_is_detected(monkeypatch,tmp_path):
+    descriptor,bodies = runtime_descriptor(b"111122223333")
+    runtime_network(monkeypatch,bodies)
+    def mutate(done,total):
+        if done==total:
+            first = next(tmp_path.glob("runtime-*/part-000.verified"))
+            first.write_bytes(b"!" * first.stat().st_size)
+    with pytest.raises(update.UpdateError,match="合并期间"):
+        update.download_runtime_bundle(descriptor,tmp_path,mutate,repository=REPOSITORY)
+    assert not list(tmp_path.glob("runtime-*/runtime.zip"))
+
+
+def test_runtime_rejects_recursive_bootstrap_and_applies_ready_marker_last(monkeypatch,tmp_path):
+    ready = json.dumps({"schema_version":1,"application":update.APPLICATION,"version":VERSION,
+                        "build_id":"voice-ab-test-r1"}).encode()
+    files = {"_updater/runtime-ready.json":ready,"FanyiJiVoiceNext.exe":b"new exe",
+             "runtime/llama-server.exe":b"new runtime"}
+    package = archive(tmp_path,files)
+    descriptor,bodies = runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch,bodies)
+    downloaded = update.download_runtime_bundle(descriptor,tmp_path / "downloads",repository=REPOSITORY)
+    install = installation(tmp_path)
+    prepared = update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
+    original,order = update._atomic_copy,[]
+    def copy(source,target):
+        order.append(target.relative_to(install).as_posix())
+        original(source,target)
+    monkeypatch.setattr(update,"_atomic_copy",copy)
+    update.apply_update(prepared.job_path,restart=False)
+    assert order[-1] == "_updater/runtime-ready.json"
+    files["_updater/runtime-bootstrap.json"] = b"{}"
+    package = archive(tmp_path,files)
+    descriptor,bodies = runtime_descriptor(package.archive_path.read_bytes())
+    runtime_network(monkeypatch,bodies)
+    downloaded = update.download_runtime_bundle(descriptor,tmp_path / "other-downloads",repository=REPOSITORY)
+    with pytest.raises(update.UpdateError,match="bootstrap"):
+        update.prepare_runtime_bundle(downloaded,install,repository=REPOSITORY)
+    assert not list(downloaded.archive_path.parent.glob("prepare/install-*/job.json"))

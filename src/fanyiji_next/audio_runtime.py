@@ -90,6 +90,22 @@ def _microphone_vad_model(settings: AppSettings) -> Path | None:
 def validate_models(settings: AppSettings) -> list[str]:
     """Return actionable local-file errors, without importing or loading engines."""
     issues = []
+    if settings.recognition_backend in {"qwen3_asr", "fun_asr"}:
+        from .model_catalog import MODEL_COMBINATIONS
+        from .model_download import ModelDownloadManager, ModelDownloadError
+        try:
+            manager = ModelDownloadManager(Path(settings.external_model_root))
+            for key in MODEL_COMBINATIONS[settings.model_combination]:
+                if not manager.inspect(key).ready:
+                    issues.append("方案模型未完整下载或未通过校验，请点击“模型下载 · A/B”。")
+                    break
+        except (ModelDownloadError, ValueError, OSError) as exc:
+            issues.append(f"模型目录不可用：{exc}")
+        if not settings.vad_model or not _path(settings.vad_model).is_file():
+            issues.append("请下载 A/B 共用的 Silero VAD 辅助模型。")
+        if not settings.hymt_server_exe or not _path(settings.hymt_server_exe).is_file():
+            issues.append("缺少随程序提供的 llama-server 翻译运行库，请使用完整程序包。")
+        return issues
     if settings.recognition_backend == "whisper":
         from .recognition_engines import validate_whisper_model_directory
         issues.extend(validate_whisper_model_directory(settings.whisper_model_dir))
@@ -270,9 +286,19 @@ class _LocalEngine:
         except RecognitionCancelled as exc:
             raise _LoadingCancelled() from exc
 
-    def translate(self, text: str, direction: str, *, context_id: str = "default") -> str:
+    def recognize_result(self, samples):
         self._check_cancelled()
         try:
+            return self.recognizer.recognize_result(samples)
+        except RecognitionCancelled as exc:
+            raise _LoadingCancelled() from exc
+
+    def translate(self, text: str, direction: str, *, context_id: str = "default", source_language=None) -> str:
+        self._check_cancelled()
+        try:
+            if self._translation_backend == "translategemma":
+                return self.translator.translate(text, direction, context_id=context_id,
+                                                 source_language=source_language)
             if self._translation_backend == "hymt":
                 return self.translator.translate(text, direction, context_id=context_id)
             return self.translator.translate(text, direction)
@@ -636,8 +662,12 @@ class VoiceRuntime:
             "speech_detector": segment.speech_detector,
         }
         asr_started_at = time.perf_counter()
+        source_language = None
         try:
-            if session.settings.recognition_backend == "whisper":
+            if session.settings.recognition_backend in {"qwen3_asr", "fun_asr"}:
+                result = engine.recognize_result(segment.samples)
+                text, source_language = result.text, result.language
+            elif session.settings.recognition_backend == "whisper":
                 language = "zh" if segment.direction == "zh_to_ja" else "ja"
                 text = engine.recognize(segment.samples, language=language)
             else:
@@ -653,6 +683,9 @@ class VoiceRuntime:
             )
             return
         asr_ms = _milliseconds(asr_started_at, time.perf_counter())
+        if session.settings.recognition_backend in {"qwen3_asr", "fun_asr"}:
+            timing.update(source_language=source_language or "",
+                          target_language="ja" if segment.direction == "zh_to_ja" else "zh")
         if session.stop.is_set() or not text:
             return
         self._emit(
@@ -663,7 +696,10 @@ class VoiceRuntime:
             return
         translation_started_at = time.perf_counter()
         try:
-            if session.settings.translation_backend == "hymt":
+            if session.settings.translation_backend == "translategemma":
+                translated = engine.translate(text, segment.direction, context_id=segment.channel,
+                                               source_language=source_language)
+            elif session.settings.translation_backend == "hymt":
                 translated = engine.translate(text, segment.direction, context_id=segment.channel)
             else:
                 translated = engine.translate(text, segment.direction)

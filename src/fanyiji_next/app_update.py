@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 from contextlib import contextmanager
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -33,7 +34,9 @@ FEED_NAME = "update-feed.json"
 ARCHIVE_MANIFEST = "update-manifest.json"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 2 * 1024**3
-MAX_EXTRACT_BYTES = 8 * 1024**3
+MAX_RUNTIME_DOWNLOAD_BYTES = 8 * 1024**3
+MAX_EXTRACT_BYTES = 12 * 1024**3
+MAX_RUNTIME_PARTS = 16
 MAX_ARCHIVE_FILES = 100000
 PROTECTED_PARTS = frozenset({"models", "settings", "user-data", "artifacts", "logs", "cache"})
 PROGRAM_DIRECTORIES = frozenset({"_internal", "licenses", "_updater", "runtime"})
@@ -42,7 +45,18 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?\Z")
 _DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?\Z", re.I)
-_MODEL_SUFFIXES = frozenset({".onnx", ".gguf", ".safetensors", ".pt", ".pth", ".ckpt", ".tflite"})
+_MODEL_SUFFIXES = frozenset({".onnx", ".gguf", ".safetensors", ".pt", ".pth", ".ckpt", ".tflite", ".bin", ".model"})
+_NORMALIZATION_TABLES = frozenset(f"_internal/sentencepiece/package_data/{name}.bin"
+                                 for name in ("nfkc", "nfkc_cf", "nmt_nfkc", "nmt_nfkc_cf"))
+_DEPENDENCY_MODEL_CODE = frozenset(("_internal", package, "models")
+                                  for package in ("ctranslate2", "transformers", "funasr", "torchaudio")) | {
+                                      ("_internal", "torchaudio", "prototype", "models")}
+_DEPENDENCY_CODE_SUFFIXES = frozenset({".py", ".pyc", ".pyd"})
+_TORCH_AUTOHEURISTIC_DIRECTORY = "_internal/torch/_inductor/autoheuristic/artifacts"
+_TORCH_AUTOHEURISTIC_FILES = frozenset(
+    _TORCH_AUTOHEURISTIC_DIRECTORY + "/" + name + ".py"
+    for name in ("__init__", "_MixedMMA100", "_MixedMMH100", "_MMRankingA100", "_MMRankingH100", "_PadMMA100")
+)
 
 
 class UpdateError(RuntimeError):
@@ -79,6 +93,36 @@ class PreparedUpdate:
     @property
     def cache_dir(self) -> Path:
         return self.job_path.parent
+
+
+@dataclass(frozen=True)
+class RuntimeBundlePart:
+    name: str
+    url: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class RuntimeBundleDescriptor:
+    version: str
+    build_id: str
+    name: str
+    size: int
+    sha256: str
+    parts: tuple[RuntimeBundlePart, ...]
+
+    def as_dict(self) -> dict:
+        return {"schema_version": 1, "application": APPLICATION, "platform": PLATFORM, "kind": "runtime-bundle",
+                "version": self.version, "build_id": self.build_id, "name": self.name, "size": self.size,
+                "sha256": self.sha256,
+                "parts": [{key: getattr(part, key) for key in ("name", "url", "size", "sha256")} for part in self.parts]}
+
+
+@dataclass(frozen=True)
+class DownloadedRuntimeBundle:
+    descriptor: RuntimeBundleDescriptor
+    archive_path: Path
 
 
 def _version_key(value: str):
@@ -184,10 +228,12 @@ class UpdateClient:
         self.cache_dir = Path(cache_dir) if cache_dir else _default_cache()
         self.timeout = timeout
 
-    def _open(self, url: str, *, api: bool = False):
+    def _open(self, url: str, *, api: bool = False, headers: dict | None = None):
         _trusted_url(url, self.repository, api=api)
         opener = build_opener(_TrustedRedirect(self.repository, api))
-        request = Request(url, headers={"User-Agent": "FanyiJiVoiceNext-Updater", "Accept": "application/vnd.github+json" if api else "application/octet-stream"})
+        request_headers = {"User-Agent": "FanyiJiVoiceNext-Updater", "Accept": "application/vnd.github+json" if api else "application/octet-stream"}
+        request_headers.update(headers or {})
+        request = Request(url, headers=request_headers)
         try:
             response = opener.open(request, timeout=self.timeout)
             try:
@@ -292,7 +338,8 @@ class UpdateClient:
         except (OSError, URLError) as exc:
             raise UpdateError(f"下载更新失败：{exc}") from exc
 
-    def prepare(self, downloaded: DownloadedUpdate, install_dir: Path, executable: str = "FanyiJiVoiceNext.exe") -> PreparedUpdate:
+    def prepare(self, downloaded: DownloadedUpdate, install_dir: Path, executable: str = "FanyiJiVoiceNext.exe", *,
+                _stage_check=None) -> PreparedUpdate:
         if executable != "FanyiJiVoiceNext.exe":
             raise UpdateError("更新目标不是翻译姬语音版程序")
         _reject_link_tree(Path(install_dir))
@@ -311,6 +358,8 @@ class UpdateClient:
         stage = job_dir / "staged"
         stage.mkdir()
         _extract_program(archive, stage, downloaded.info.version)
+        if _stage_check is not None:
+            _stage_check(stage)
         payload = {"schema_version": 1, "application": APPLICATION, "version": downloaded.info.version,
                    "install_dir": str(install), "stage_dir": str(stage), "backup_dir": str(job_dir / "backup"),
                    "executable": executable, "pid": 0, "restart_args": []}
@@ -319,12 +368,259 @@ class UpdateClient:
         return PreparedUpdate(job, install, downloaded.info.version)
 
 
+def parse_runtime_bundle_descriptor(value, *, repository: str = DEFAULT_REPOSITORY) -> RuntimeBundleDescriptor:
+    """Validate a separate runtime descriptor without changing the stable feed schema."""
+    if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository):
+        raise UpdateError("运行库更新仓库无效")
+    if isinstance(value, RuntimeBundleDescriptor):
+        value = value.as_dict()
+    value = _object(value, {"schema_version", "application", "platform", "kind", "version", "build_id",
+                            "name", "size", "sha256", "parts"}, "运行库描述")
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or value["application"] != APPLICATION or value["platform"] != PLATFORM or value["kind"] != "runtime-bundle"):
+        raise UpdateError("运行库描述的产品、平台或格式不匹配")
+    _version_key(value["version"])
+    build_id = value["build_id"]
+    if not isinstance(build_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", build_id):
+        raise UpdateError("运行库 build_id 无效")
+    name = _runtime_asset_name(value["name"])
+    if not name.endswith(".zip"):
+        raise UpdateError("合并运行库必须为 ZIP")
+    size = _positive_size(value["size"], MAX_RUNTIME_DOWNLOAD_BYTES, "完整运行库")
+    checksum = _sha(value["sha256"])
+    rows = value["parts"]
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_RUNTIME_PARTS:
+        raise UpdateError("运行库分卷数量无效")
+    parts, names = [], {name.casefold()}
+    for row in rows:
+        _object(row, {"name", "url", "size", "sha256"}, "运行库分卷")
+        part_name = _runtime_asset_name(row["name"])
+        if part_name.casefold() in names:
+            raise UpdateError("运行库分卷名称重复或冲突")
+        names.add(part_name.casefold())
+        # Exact URL binding also rejects queries, encoded separators, empty
+        # credentials, alternate ports, wrong versions and foreign repositories.
+        expected_url = f"https://github.com/{repository}/releases/download/v{value['version']}/{part_name}"
+        if row["url"] != expected_url:
+            raise UpdateError("运行库分卷地址与仓库、版本或文件名不匹配")
+        _trusted_url(row["url"], repository)
+        parts.append(RuntimeBundlePart(part_name, row["url"],
+                     _positive_size(row["size"], MAX_DOWNLOAD_BYTES - 1, "运行库分卷"), _sha(row["sha256"])))
+    if sum(part.size for part in parts) != size:
+        raise UpdateError("运行库分卷总大小与完整描述不一致")
+    return RuntimeBundleDescriptor(value["version"], build_id, name, size, checksum, tuple(parts))
+
+
+def _runtime_asset_name(value):
+    if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", value)
+            or _safe_path(value).name != value):
+        raise UpdateError("运行库资源文件名无效")
+    return value
+
+
+def _runtime_safe_file(path: Path):
+    _reject_link_tree(path)
+    if path.exists():
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise UpdateError("运行库缓存不是独占的普通文件")
+
+
+def _runtime_hash(path: Path, cancel_event=None):
+    _runtime_safe_file(path)
+    checksum = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            _cancel(cancel_event.is_set if cancel_event is not None else None)
+            block = source.read(1024 * 1024)
+            if not block:
+                return checksum.hexdigest()
+            checksum.update(block)
+
+
+def _runtime_quarantine(path: Path):
+    _runtime_safe_file(path)
+    if path.is_file():
+        path.replace(path.with_name(path.name + ".bad-" + uuid.uuid4().hex))
+
+
+def _download_runtime_part(client, part, target, progress, cancel_event):
+    partial = target.with_name(target.name + ".part")
+    cancelled = cancel_event.is_set if cancel_event is not None else None
+    _runtime_safe_file(target)
+    _runtime_safe_file(partial)
+    if target.is_file():
+        if target.stat().st_size == part.size and _runtime_hash(target, cancel_event) == part.sha256:
+            progress(part.size)
+            return
+        _runtime_quarantine(target)
+    if partial.is_file() and partial.stat().st_size > part.size:
+        _runtime_quarantine(partial)
+    for attempt in range(2):
+        _cancel(cancelled)
+        if partial.is_file() and partial.stat().st_size == part.size:
+            if _runtime_hash(partial, cancel_event) == part.sha256:
+                partial.replace(target)
+                progress(part.size)
+                return
+            _runtime_quarantine(partial)
+        offset = partial.stat().st_size if partial.is_file() else 0
+        headers = {"Accept-Encoding": "identity"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        try:
+            with client._open(part.url, headers=headers) as response:
+                status = getattr(response, "status", None)
+                if status not in {200, 206}:
+                    raise UpdateError("运行库服务器未返回有效内容")
+                if response.headers.get("Content-Encoding", "identity").lower() not in {"", "identity"}:
+                    raise UpdateError("运行库分卷不接受压缩传输")
+                if status == 206:
+                    expected_range = f"bytes {offset}-{part.size - 1}/{part.size}"
+                    if response.headers.get("Content-Range") != expected_range:
+                        raise UpdateError("运行库续传范围不匹配")
+                else:
+                    offset = 0  # A server ignoring Range must never append to the old prefix.
+                length = response.headers.get("Content-Length")
+                if length is not None and (not length.isdecimal() or int(length) != part.size - offset):
+                    raise UpdateError("运行库分卷 Content-Length 不匹配")
+                _runtime_safe_file(partial)
+                with partial.open("r+b" if partial.exists() else "xb") as output:
+                    if not offset:
+                        output.truncate(0)
+                    elif os.fstat(output.fileno()).st_size != offset:
+                        raise UpdateError("运行库部分文件在续传前发生变化")
+                    output.seek(offset)
+                    received = offset
+                    progress(received)
+                    try:
+                        while True:
+                            _cancel(cancelled)
+                            try:
+                                block = response.read(256 * 1024)
+                            except (OSError, HTTPException) as error:
+                                raise UpdateError("运行库下载连接中断") from error
+                            if not block:
+                                break
+                            if received + len(block) > part.size:
+                                raise UpdateError("运行库分卷超过描述大小")
+                            output.write(block)
+                            received += len(block)
+                            progress(received)
+                    finally:
+                        output.flush()
+                        os.fsync(output.fileno())
+                if received != part.size:
+                    raise UpdateError("运行库分卷下载未完成，已保留续传数据")
+            if _runtime_hash(partial, cancel_event) != part.sha256:
+                _runtime_quarantine(partial)
+                raise UpdateError("运行库分卷 SHA256 不匹配，坏片已隔离")
+            partial.replace(target)
+            return
+        except UpdateCancelled:
+            raise
+        except UpdateError as error:
+            if attempt:
+                raise UpdateError("运行库分卷下载失败；部分数据已保留，可重试续传") from error
+            if cancel_event is not None and cancel_event.wait(.25):
+                _cancel(cancelled)
+        except (OSError, URLError, HTTPException) as error:
+            raise UpdateError("运行库缓存读写失败；部分数据已保留") from error
+
+
+def download_runtime_bundle(descriptor, destination, progress_cb=None, cancel_event=None, *,
+                            repository: str = DEFAULT_REPOSITORY) -> DownloadedRuntimeBundle:
+    """Download verified raw parts into a resumable cache directory, then merge."""
+    spec = parse_runtime_bundle_descriptor(descriptor, repository=repository)
+    cancelled = cancel_event.is_set if cancel_event is not None else None
+    _cancel(cancelled)
+    destination = Path(destination).absolute()
+    _reject_link_tree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256(json.dumps(spec.as_dict(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    folder = destination / ("runtime-" + identity)
+    _reject_link_tree(folder)
+    folder.mkdir(exist_ok=True)
+    archive = folder / spec.name
+    with _installation_lock(folder):
+        _runtime_safe_file(archive)
+        if archive.is_file():
+            if archive.stat().st_size == spec.size and _runtime_hash(archive, cancel_event) == spec.sha256:
+                if progress_cb:
+                    progress_cb(spec.size, spec.size)
+                return DownloadedRuntimeBundle(spec, archive)
+            _runtime_quarantine(archive)
+        completed = 0
+        parts = []
+        for index, part in enumerate(spec.parts):
+            target = folder / f"part-{index:03d}.verified"
+            def progress(received):
+                if progress_cb:
+                    progress_cb(completed + received, spec.size)
+            _download_runtime_part(UpdateClient(repository), part, target, progress, cancel_event)
+            completed += part.size
+            parts.append(target)
+        merged = folder / "merged.zip.part"
+        _runtime_safe_file(merged)
+        checksum, total = hashlib.sha256(), 0
+        with merged.open("wb") as output:
+            for path, part in zip(parts, spec.parts):
+                _runtime_safe_file(path)
+                part_hash, part_size = hashlib.sha256(), 0
+                with path.open("rb") as source:
+                    while True:
+                        _cancel(cancelled)
+                        block = source.read(1024 * 1024)
+                        if not block:
+                            break
+                        total += len(block)
+                        part_size += len(block)
+                        if total > spec.size or part_size > part.size:
+                            raise UpdateError("合并期间运行库分卷大小发生变化")
+                        part_hash.update(block)
+                        checksum.update(block)
+                        output.write(block)
+                if part_size != part.size or part_hash.hexdigest() != part.sha256:
+                    raise UpdateError("合并期间运行库分卷校验失败")
+            output.flush()
+            os.fsync(output.fileno())
+        _cancel(cancelled)
+        if total != spec.size or checksum.hexdigest() != spec.sha256:
+            raise UpdateError("完整运行库合并 SHA256 不匹配；未安装")
+        merged.replace(archive)
+        return DownloadedRuntimeBundle(spec, archive)
+
+
+def prepare_runtime_bundle(downloaded: DownloadedRuntimeBundle, install_dir: Path, *, cache_dir=None,
+                           repository: str = DEFAULT_REPOSITORY) -> PreparedUpdate:
+    """Stage a full, verified program bundle and check its exact readiness marker."""
+    if not isinstance(downloaded, DownloadedRuntimeBundle):
+        raise UpdateError("运行库下载结果无效")
+    spec = parse_runtime_bundle_descriptor(downloaded.descriptor, repository=repository)
+    info = UpdateInfo(spec.version, spec.name, spec.parts[0].url, spec.sha256, spec.size,
+                      f"https://github.com/{repository}/releases/tag/v{spec.version}")
+    return UpdateClient(repository, Path(cache_dir) if cache_dir else Path(downloaded.archive_path).parent / "prepare").prepare(
+        DownloadedUpdate(info, downloaded.archive_path), install_dir, _stage_check=lambda stage: _verify_runtime_ready(stage, spec))
+
+
+def _verify_runtime_ready(stage: Path, spec: RuntimeBundleDescriptor):
+    ready = stage / "_updater" / "runtime-ready.json"
+    if not ready.is_file() or ready.stat().st_size > MAX_JSON_BYTES:
+        raise UpdateError("完整运行库缺少 runtime-ready.json")
+    value = _object(_json(ready.read_bytes()), {"schema_version", "application", "version", "build_id"}, "运行库完成标识")
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["application"] != APPLICATION
+            or value["version"] != spec.version or value["build_id"] != spec.build_id):
+        raise UpdateError("运行库完成标识与下载描述不匹配")
+    if (stage / "_updater" / "runtime-bootstrap.json").exists():
+        raise UpdateError("完整运行库不得包含 bootstrap 描述")
+
+
 def _cancel(cancelled):
     if cancelled and cancelled():
         raise UpdateCancelled("更新下载已取消；现有程序和模型未更改")
 
 
-def _safe_path(value: str) -> PurePosixPath:
+def _safe_path(value: str, *, directory: bool = False) -> PurePosixPath:
     if (not isinstance(value, str) or not value or "\\" in value or ":" in value
             or "\x00" in value or value.startswith("/") or any(ord(c) < 32 for c in value)):
         raise UpdateError("更新包包含非法路径")
@@ -332,13 +628,23 @@ def _safe_path(value: str) -> PurePosixPath:
     if (path.as_posix() != value or any(part in {".", "..", ""} or part.endswith((".", " "))
             or _DEVICE_NAME.fullmatch(part) or any(c in part for c in '<>"|?*') for part in path.parts)):
         raise UpdateError(f"更新包路径不安全：{value}")
-    # ctranslate2/models/__init__.py is dependency source, not model data.
-    dependency_models = tuple(p.casefold() for p in path.parts[:3]) == ("_internal", "ctranslate2", "models")
-    protected = any(part.casefold() in PROTECTED_PARTS and not (index == 2 and dependency_models
-                    and (len(path.parts) == 3 or path.suffix.casefold() in {".py", ".pyc", ".pyd"}))
-                    for index, part in enumerate(path.parts))
+    # Libraries use packages named "models" for implementation code. These
+    # exact prefixes do not grant permission to update weights or user models.
+    lowered = tuple(part.casefold() for part in path.parts)
+    if "__pycache__" in lowered or any(lowered[index:index + 3] == ("jieba", "lac_small", "model_baseline")
+                                       for index in range(len(lowered) - 2)):
+        raise UpdateError(f"程序更新包不得包含依赖模型权重或生成缓存：{value}")
+    code_entry = directory or path.suffix.casefold() in _DEPENDENCY_CODE_SUFFIXES
+    # The six shipped Torch heuristic source modules use a directory called
+    # artifacts. This exception does not permit user artifacts or weight files.
+    torch_heuristic = (value == _TORCH_AUTOHEURISTIC_DIRECTORY if directory
+                       else value in _TORCH_AUTOHEURISTIC_FILES)
+    protected = any((part in PROTECTED_PARTS or part.endswith("_models"))
+                    and not ((lowered[:index + 1] in _DEPENDENCY_MODEL_CODE and code_entry)
+                             or (index == 4 and part == "artifacts" and torch_heuristic))
+                    for index, part in enumerate(lowered))
     if (protected or path.name.casefold().endswith(".settings.json") or path.name.casefold() == "settings.json"
-            or path.suffix.casefold() in _MODEL_SUFFIXES or path.name.casefold() == "model.bin"):
+            or (path.suffix.casefold() in _MODEL_SUFFIXES and value not in _NORMALIZATION_TABLES)):
         raise UpdateError(f"程序更新包不得包含模型、设置或用户资料：{value}")
     return path
 
@@ -398,7 +704,7 @@ def _extract_program(archive: Path, stage: Path, version: str):
             paths, files, spellings = {}, {}, {}
             for entry in infos:
                 value = entry.filename[:-1] if entry.is_dir() else entry.filename
-                path = _safe_path(value)
+                path = _safe_path(value, directory=entry.is_dir())
                 _case_path(path, spellings)
                 if entry.is_dir():
                     if path.parts[0].casefold() not in PROGRAM_DIRECTORIES:
@@ -645,7 +951,9 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
     backup.mkdir()
     touched = []
     try:
-        for row in rows:
+        # A bootstrap becomes runnable only after every program file has been
+        # replaced successfully. Keep the readiness marker last in the transaction.
+        for row in sorted(rows, key=lambda row: row["path"].casefold() == "_updater/runtime-ready.json"):
             relative = row["path"]
             target = _inside(install / relative, install)
             previous = _inside(backup / relative, backup)

@@ -12,12 +12,44 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from fanyiji_next import app as application
-from fanyiji_next import audio_runtime, settings, studio
+from fanyiji_next import audio_runtime, model_paths, settings, studio
 from fanyiji_next import verification
 
 
 def forbidden(*_args, **_kwargs):
     raise AssertionError("Audio capture, model loading or settings access was unexpected")
+
+
+def assert_ab_profile(window, combination="A", *, root=None):
+    """Normal startup exposes only the selected pair under the main-file root."""
+    value = window.settings
+    root = Path(root) if root is not None else model_paths.external_model_root()
+    assert value.model_combination == combination
+    assert value.recognition_backend == ("qwen3_asr" if combination == "A" else "fun_asr")
+    assert value.translation_backend == "translategemma"
+    assert value.system_audio_processing == "raw"
+    assert value.external_model_root == str(root)
+    if combination == "A":
+        assert value.qwen_asr_model_dir == str(root / "qwen3-asr-0.6b-hf-bf16")
+        assert value.fun_asr_model_dir == ""
+    else:
+        assert value.fun_asr_model_dir == str(root / "fun-asr-nano-2512-bf16")
+        assert value.qwen_asr_model_dir == ""
+    assert value.gemma_model_file == str(root / "translategemma-4b-it-q4_k_m/translategemma-4b-it.Q4_K_M.gguf")
+    assert value.vad_model == str(root / "silero-vad-onnx/silero_vad.onnx")
+    assert value.recognition_compute_type == "bfloat16"
+    for name in ("asr_model", "asr_tokens", "translation_model_dir", "translation_spm", "whisper_model_dir",
+                 "nllb_model_dir", "nllb_tokenizer_dir", "hymt_model_file", "mdx_model_file", "gtcrn_model_file"):
+        assert getattr(value, name) == "", name
+
+
+def assert_personal_preferences(window, saved, *, transparency=True):
+    names = ["font_size", "show_original", "always_on_top", "microphone", "system",
+             "recognition_device", "translation_device", "translation_compute_type"]
+    if transparency:
+        names += ["window_opacity", "window_transparency_enabled"]
+    for name in names:
+        assert getattr(window.settings, name) == getattr(saved, name), name
 
 
 @pytest.fixture
@@ -43,7 +75,7 @@ def test_voice_smoke_uses_fake_runtime_and_never_reads_or_writes_settings(monkey
     assert result["checks"]["stop_preserves_history"]
 
 
-def test_normal_startup_only_suggests_local_models_and_waits_for_manual_start(monkeypatch, tmp_path):
+def test_normal_startup_binds_only_ab_root_and_waits_for_manual_start(monkeypatch, tmp_path):
     qt_app = QApplication.instance() or QApplication([])
     windows = []
     real_window = studio.StudioWindow
@@ -59,7 +91,8 @@ def test_normal_startup_only_suggests_local_models_and_waits_for_manual_start(mo
         assert window.settings.font_size == 30
         assert window._controller.state == "stopped"
         assert window._controller._runtime is None
-        assert window.settings.asr_model == str(tmp_path / "models/asr/model.int8.onnx")
+        assert_ab_profile(window)
+        assert window.settings.external_model_root != str(model_root)
         assert window._settings_source == str(target.resolve())
         assert str(target.resolve()) in window.model_button.toolTip()
         window.close()
@@ -76,6 +109,7 @@ def test_normal_startup_only_suggests_local_models_and_waits_for_manual_start(mo
     target = tmp_path / "config/settings.json"
     assert application.main(["--model-root", str(model_root), "--settings-file", str(target)]) == 0
     assert not target.exists()
+    assert (model_root / "asr/model.int8.onnx").read_bytes() == b"fixture"
     for window in windows:
         window.deleteLater()
     qt_app.processEvents()
@@ -143,14 +177,17 @@ def test_invalid_backend_is_rejected_by_argparse_before_runtime_access(monkeypat
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_gui_preserves_saved_backend_unless_cli_explicitly_overrides(monkeypatch, tmp_path, explicit):
-    from fanyiji_next.models import AppSettings
+def test_gui_migrates_legacy_engines_to_a_even_with_legacy_cli_overrides(monkeypatch, tmp_path, explicit):
+    from fanyiji_next.models import AppSettings, ChannelSettings
 
     qt_app = QApplication.instance() or QApplication([])
     target = tmp_path / "settings.json"
     target.write_text("fixture; reading is mocked", encoding="utf-8")
     saved = AppSettings(recognition_backend="whisper", translation_backend="nllb", system_audio_processing="mdx_gtcrn",
-                        mdx_model_file="D:/chosen/mdx.onnx", gtcrn_model_file="D:/chosen/gtcrn.onnx")
+                        mdx_model_file="D:/chosen/mdx.onnx", gtcrn_model_file="D:/chosen/gtcrn.onnx",
+                        font_size=35, show_original=False, window_opacity=76,
+                        microphone=ChannelSettings(False, "ja_to_zh", 2),
+                        system=ChannelSettings(True, "zh_to_ja", 7))
     monkeypatch.setattr(settings, "load_settings", lambda path: saved)
     monkeypatch.setattr(settings, "save_settings", forbidden)
     monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
@@ -162,11 +199,8 @@ def test_gui_preserves_saved_backend_unless_cli_explicitly_overrides(monkeypatch
         return window
     def inspect_idle(_self):
         window = windows[-1]
-        assert window.settings.recognition_backend == ("sensevoice" if explicit else "whisper")
-        assert window.settings.translation_backend == ("m2m100" if explicit else "nllb")
-        assert window.settings.system_audio_processing == ("raw" if explicit else "mdx_gtcrn")
-        assert window.settings.mdx_model_file == saved.mdx_model_file
-        assert window.settings.gtcrn_model_file == saved.gtcrn_model_file
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved)
         assert window._settings_source == str(target.resolve())
         assert str(target.resolve()) in window.mode_label.toolTip()
         assert window._controller._runtime is None
@@ -243,7 +277,7 @@ def probe_normal_startup(monkeypatch, arguments, check):
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_portable_release_defaults_preserve_saved_profile_and_relocate_models(monkeypatch, tmp_path, existing):
-    from fanyiji_next.release_profile import write_release_defaults
+    from fanyiji_next.release_profile import load_release_defaults, write_release_defaults
 
     portable = tmp_path / "moved-portable"
     portable.mkdir()
@@ -254,7 +288,10 @@ def test_portable_release_defaults_preserve_saved_profile_and_relocate_models(mo
     appdata = tmp_path / "isolated-appdata"
     target = appdata / "FanyiJiVoiceNext/settings.json"
     if existing:
-        write_profile(target, recognition_backend="sensevoice", translation_backend="m2m100")
+        saved = write_profile(target, recognition_backend="sensevoice", translation_backend="m2m100",
+                              font_size=31, show_original=False, window_opacity=68)
+    else:
+        saved = load_release_defaults(portable / "release-defaults.json")
     before = target.read_bytes() if existing else None
     monkeypatch.setenv("LOCALAPPDATA", str(appdata))
     monkeypatch.setattr(application.sys, "frozen", True, raising=False)
@@ -262,15 +299,13 @@ def test_portable_release_defaults_preserve_saved_profile_and_relocate_models(mo
     monkeypatch.setattr(application, "_discover_project_root", lambda: None)
 
     def check(window):
-        assert window.settings.recognition_backend == ("sensevoice" if existing else "whisper")
-        assert window.settings.translation_backend == ("m2m100" if existing else "hymt")
-        if not existing:
-            assert window.settings.system_audio_processing == "mdx_gtcrn"
-            assert window.settings.whisper_model_dir == str(model.parent)
+        assert_ab_profile(window, root=portable / "FanyiJiVoiceNext_models")
+        assert_personal_preferences(window, saved)
         assert window.update_button.isVisible()
 
     probe_normal_startup(monkeypatch, [], check)
     assert (target.read_bytes() if target.exists() else None) == before
+    assert model.read_bytes() == b"fixture"
 
 
 def test_update_restart_preserves_explicit_profile_and_model_cli(monkeypatch, tmp_path):
@@ -283,15 +318,166 @@ def test_update_restart_preserves_explicit_profile_and_model_cli(monkeypatch, tm
     ))
 
 
+def test_old_ui_saved_b_backend_with_stale_a_pair_is_recovered_only_in_memory(monkeypatch, tmp_path):
+    target = tmp_path / "old-ui-settings.json"
+    saved = write_profile(target, recognition_backend="fun_asr", model_combination="A",
+                          translation_backend="translategemma", font_size=33)
+    before = target.read_bytes()
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    def check(window):
+        assert window.settings.model_combination == "B"
+        assert window.settings.recognition_backend == "fun_asr"
+        assert window.settings.fun_asr_model_dir and not window.settings.qwen_asr_model_dir
+        assert window.settings.font_size == saved.font_size
+    probe_normal_startup(monkeypatch, ["--settings-file", str(target)], check)
+    assert target.read_bytes() == before
+
+
+def test_startup_error_message_box_closes_after_three_seconds_and_keeps_report(tmp_path):
+    import time
+    qt_app = QApplication.instance() or QApplication([])
+    report = tmp_path / "startup-error.json"
+    started = time.monotonic()
+    assert application._startup_profile_error(tmp_path / "missing-settings.json", "配置文件不存在。", report) == 2
+    assert 2.7 <= time.monotonic() - started < 5.5
+    value = json.loads(report.read_text(encoding="utf-8"))
+    assert "配置文件不存在" in value["startup_error"]
+    assert value["audio_capture"] is value["models_loaded"] is value["settings_written"] is False
+    assert not any(isinstance(widget, QMessageBox) and widget.isVisible() for widget in qt_app.topLevelWidgets())
+
+
+@pytest.mark.parametrize("exe_name", ["FanyiJiVoiceNext.exe", "我的译音.exe"])
+def test_saved_b_is_preserved_and_rebound_to_current_exe_name_without_touching_profile(monkeypatch, tmp_path, exe_name):
+    from fanyiji_next.models import ChannelSettings
+
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    executable = portable / exe_name
+    extraction = tmp_path / "_MEI_fake"
+    extraction.mkdir()
+    cwd = tmp_path / "unrelated-cwd"
+    cwd.mkdir()
+    old_root = tmp_path / "old-name_models"
+    old_root.mkdir()
+    sentinel = old_root / "keep-existing-model.bin"
+    sentinel.write_bytes(b"model-root must not move or delete old files")
+    target = tmp_path / "chosen-profile/settings.json"
+    saved = write_profile(target, model_combination="B", recognition_backend="fun_asr",
+                          translation_backend="translategemma", external_model_root=str(old_root),
+                          fun_asr_model_dir=str(old_root / "fun-stale"),
+                          qwen_asr_model_dir=str(old_root / "qwen-stale"),
+                          gemma_model_file=str(old_root / "gemma-stale.gguf"),
+                          vad_model=str(old_root / "vad-stale.onnx"),
+                          font_size=32, show_original=False, window_opacity=73,
+                          window_transparency_enabled=False,
+                          microphone=ChannelSettings(False, "ja_to_zh", 5),
+                          system=ChannelSettings(True, "zh_to_ja", 8))
+    before = target.read_bytes()
+    monkeypatch.setattr(application.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(application.sys, "executable", str(executable))
+    monkeypatch.setattr(application.sys, "_MEIPASS", str(extraction), raising=False)
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    monkeypatch.chdir(cwd)
+    command = ["--settings-file", str(target), "--require-settings", "--model-root", str(tmp_path / "ignored-model-root")]
+    expected_root = portable / f"{Path(exe_name).stem}_models"
+
+    def check(window):
+        assert_ab_profile(window, "B", root=expected_root)
+        assert_personal_preferences(window, saved)
+        assert window._settings_source == str(target.resolve())
+        assert window._controller._settings_file == target.resolve()
+        assert window._update_restart_args == tuple(command)
+        assert not expected_root.exists()
+
+    probe_normal_startup(monkeypatch, command, check)
+    assert target.read_bytes() == before
+    assert sentinel.read_bytes() == b"model-root must not move or delete old files"
+    assert not expected_root.exists()
+
+
+def test_renaming_exe_between_starts_changes_only_in_memory_model_root(monkeypatch, tmp_path):
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    target = tmp_path / "chosen.json"
+    saved = write_profile(target, model_combination="B", recognition_backend="fun_asr",
+                          translation_backend="translategemma", font_size=29)
+    before = target.read_bytes()
+    monkeypatch.setattr(application.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    first_main = application.main
+    for name in ("翻译姬.exe", "翻译姬改名.exe"):
+        # Each probe installs a Studio factory; restore the real entry points
+        # between launches so nested wrappers cannot hide a different profile.
+        with monkeypatch.context() as launch:
+            launch.setattr(application.sys, "executable", str(portable / name))
+            expected_root = portable / f"{Path(name).stem}_models"
+
+            def check(window):
+                assert_ab_profile(window, "B", root=expected_root)
+                assert_personal_preferences(window, saved)
+                assert window._controller._settings_file == target.resolve()
+
+            probe_normal_startup(launch, ["--settings-file", str(target), "--require-settings"], check)
+        assert application.main is first_main
+        assert target.read_bytes() == before
+    assert not (portable / "翻译姬_models").exists()
+    assert not (portable / "翻译姬改名_models").exists()
+
+
+def test_ab_runtime_check_includes_both_recognizers_without_settings_or_weights(monkeypatch, tmp_path):
+    imported = []
+
+    def fake_import(name):
+        imported.append(name)
+        return SimpleNamespace(__version__="fixture", AutoProcessor=type("AutoProcessor", (), {}),
+                               AutoModelForMultimodalLM=type("AutoModelForMultimodalLM", (), {}),
+                               AutoModel=type("AutoModel", (), {}))
+
+    monkeypatch.setattr(application.importlib, "import_module", fake_import)
+    monkeypatch.setattr(application, "_legacy_modules", lambda: [])
+    monkeypatch.setattr(settings, "load_settings", forbidden)
+    monkeypatch.setattr(settings, "save_settings", forbidden)
+    monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
+    report = tmp_path / "ab-runtime.json"
+    assert application.check_runtime(report, ab_engines=True) == 0
+    value = json.loads(report.read_text(encoding="utf-8"))
+    assert {"torch", "torchaudio", "transformers", "funasr", "librosa", "soundfile", "safetensors"} <= set(imported)
+    assert value["ab_engines_checked"] is True
+    assert all(value["modules"][name]["available"] for name in
+               ("transformers.AutoProcessor", "transformers.AutoModelForMultimodalLM", "funasr.AutoModel"))
+    assert value["audio_capture"] is value["models_loaded"] is value["settings_written"] is False
+
+
+def test_missing_ab_runtime_dependency_is_reported_without_loading_models(monkeypatch, tmp_path):
+    def fake_import(name):
+        if name == "funasr":
+            raise ImportError("fixture missing FunASR")
+        return SimpleNamespace(__version__="fixture")
+
+    monkeypatch.setattr(application.importlib, "import_module", fake_import)
+    monkeypatch.setattr(application, "_legacy_modules", lambda: [])
+    monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
+    report = tmp_path / "ab-runtime-error.json"
+    assert application.check_runtime(report, ab_engines=True) == 2
+    value = json.loads(report.read_text(encoding="utf-8"))
+    assert value["modules"]["funasr"]["available"] is False
+    assert "fixture missing FunASR" in value["modules"]["funasr"]["error"]
+    assert value["audio_capture"] is value["models_loaded"] is value["settings_written"] is False
+
+
 @pytest.mark.parametrize("frozen", [False, True])
 @pytest.mark.parametrize("appdata_name", ["normal-local", "packages-localcache"])
 def test_project_profile_wins_for_source_and_standard_dist_under_different_appdata(monkeypatch, tmp_path, frozen, appdata_name, stable_version):
+    from fanyiji_next.models import ChannelSettings
     project, source = make_project(tmp_path)
     profile = project / "settings/voice.settings.json"
-    saved = write_profile(profile, recognition_backend="whisper", translation_backend="hymt", system_audio_processing="mdx_gtcrn")
+    saved = write_profile(profile, recognition_backend="whisper", translation_backend="hymt", system_audio_processing="mdx_gtcrn",
+                          font_size=37, microphone=ChannelSettings(False, "ja_to_zh", 3),
+                          system=ChannelSettings(True, "zh_to_ja", 4))
     appdata = tmp_path / appdata_name
     legacy = appdata / "FanyiJiVoiceNext/settings.json"
-    write_profile(legacy, recognition_backend="sensevoice", translation_backend="m2m100")
+    write_profile(legacy, recognition_backend="sensevoice", translation_backend="m2m100", font_size=19)
+    before = {path: path.read_bytes() for path in (profile, legacy)}
     monkeypatch.setenv("LOCALAPPDATA", str(appdata))
     monkeypatch.setattr(application, "__file__", str(source))
     monkeypatch.setattr(application.sys, "frozen", frozen, raising=False)
@@ -303,15 +489,15 @@ def test_project_profile_wins_for_source_and_standard_dist_under_different_appda
     assert application._discover_project_root() == project
 
     def check(window):
-        assert window.settings.recognition_backend == saved.recognition_backend
-        assert window.settings.translation_backend == saved.translation_backend
-        assert window.settings.system_audio_processing == saved.system_audio_processing
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved)
         assert window._settings_source == str(profile.resolve())
         assert window._controller._settings_file == profile.resolve()
     probe_normal_startup(monkeypatch, [], check)
+    assert all(path.read_bytes() == content for path, content in before.items())
 
 
-def test_project_direct_exe_discovers_models_from_same_project_root(monkeypatch, tmp_path, stable_version):
+def test_project_direct_exe_uses_exe_named_external_root_and_ignores_legacy_models(monkeypatch, tmp_path, stable_version):
     project, _source = make_project(tmp_path)
     profile = project / "settings/voice.settings.json"
     write_profile(profile)
@@ -319,12 +505,11 @@ def test_project_direct_exe_discovers_models_from_same_project_root(monkeypatch,
     model.parent.mkdir(parents=True)
     model.write_bytes(b"fixture")
     monkeypatch.setattr(application.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(application.sys, "executable", str(project / "dist/0.4.6-voice/FanyiJiVoiceNext/FanyiJiVoiceNext.exe"))
-    probe_normal_startup(monkeypatch, [], lambda window: assert_model_path(window, model))
-
-
-def assert_model_path(window, path):
-    assert window.settings.asr_model == str(path)
+    executable = project / "dist/0.4.6-voice/FanyiJiVoiceNext/FanyiJiVoiceNext.exe"
+    monkeypatch.setattr(application.sys, "executable", str(executable))
+    expected = executable.parent / "FanyiJiVoiceNext_models"
+    probe_normal_startup(monkeypatch, [], lambda window: assert_ab_profile(window, root=expected))
+    assert model.read_bytes() == b"fixture" and not expected.exists()
 
 
 def test_explicit_settings_file_wins_over_an_invalid_project_profile(monkeypatch, tmp_path):
@@ -333,15 +518,17 @@ def test_explicit_settings_file_wins_over_an_invalid_project_profile(monkeypatch
     profile.parent.mkdir()
     profile.write_text("{invalid project JSON", encoding="utf-8")
     explicit = tmp_path / "chosen/voice.json"
-    saved = write_profile(explicit, recognition_backend="sensevoice", translation_backend="nllb")
+    saved = write_profile(explicit, recognition_backend="sensevoice", translation_backend="nllb", font_size=34)
+    before = {path: path.read_bytes() for path in (profile, explicit)}
     monkeypatch.setattr(application, "__file__", str(source))
     monkeypatch.setattr(application.sys, "frozen", False, raising=False)
 
     def check(window):
         assert window._settings_source == str(explicit.resolve())
-        assert window.settings.recognition_backend == saved.recognition_backend
-        assert window.settings.translation_backend == saved.translation_backend
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved)
     probe_normal_startup(monkeypatch, ["--settings-file", str(explicit)], check)
+    assert all(path.read_bytes() == content for path, content in before.items())
 
 
 @pytest.mark.parametrize("problem", ["invalid-json", "invalid-setting"])
@@ -358,17 +545,17 @@ def test_independent_explicit_profile_without_require_flag_keeps_legacy_error_no
     def check(window):
         assert window._settings_source == str(target.resolve())
         assert "设置读取失败" in window.notice.text()
-        assert window.settings.recognition_backend == "sensevoice"
-        assert window.settings.translation_backend == "hymt"
+        assert_ab_profile(window)
     probe_normal_startup(monkeypatch, ["--settings-file", str(target)], check)
     assert target.read_bytes() == before
 
 
 def test_independent_portable_exe_keeps_legacy_appdata_without_cwd_profile_discovery(monkeypatch, tmp_path):
     project, _source = make_project(tmp_path)
-    write_profile(project / "settings/voice.settings.json", recognition_backend="whisper", translation_backend="hymt")
+    write_profile(project / "settings/voice.settings.json", recognition_backend="whisper", translation_backend="hymt", font_size=39)
     legacy = tmp_path / "local/FanyiJiVoiceNext/settings.json"
-    write_profile(legacy, recognition_backend="sensevoice", translation_backend="m2m100")
+    saved = write_profile(legacy, recognition_backend="sensevoice", translation_backend="m2m100", font_size=26)
+    before = legacy.read_bytes()
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setattr(application.sys, "frozen", True, raising=False)
     monkeypatch.setattr(application.sys, "executable", str(tmp_path / "independent/FanyiJiVoiceNext.exe"))
@@ -377,9 +564,10 @@ def test_independent_portable_exe_keeps_legacy_appdata_without_cwd_profile_disco
 
     def check(window):
         assert window._settings_source == str(legacy.resolve())
-        assert window.settings.recognition_backend == "sensevoice"
-        assert window.settings.translation_backend == "m2m100"
+        assert_ab_profile(window, root=tmp_path / "independent/FanyiJiVoiceNext_models")
+        assert_personal_preferences(window, saved)
     probe_normal_startup(monkeypatch, [], check)
+    assert legacy.read_bytes() == before
 
 
 @pytest.mark.parametrize("marker", ["missing", "other-project", "invalid-toml", "invalid-project-table"])
@@ -453,9 +641,8 @@ def test_dev_project_first_start_reads_stable_only_then_saves_and_reopens_previe
         assert formal.read_bytes() == before and not preview.exists()
         assert window._settings_source == str(preview.resolve())
         assert window._controller._settings_file == preview.resolve()
-        assert window.settings.recognition_backend == saved.recognition_backend
-        assert window.settings.translation_backend == saved.translation_backend
-        assert window.settings.system_audio_processing == saved.system_audio_processing
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved)
         monkeypatch.setattr(settings, "save_settings", original_save)
         window.transparency_slider.setValue(45)
         assert window.settings.window_opacity == 55
@@ -470,8 +657,8 @@ def test_dev_project_first_start_reads_stable_only_then_saves_and_reopens_previe
         assert window._controller._settings_file == preview.resolve()
         assert window.settings.window_opacity == 55
         assert window.settings.window_transparency_enabled is True
-        assert window.settings.recognition_backend == saved.recognition_backend
-        assert window.settings.translation_backend == saved.translation_backend
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved, transparency=False)
 
     probe_normal_startup(monkeypatch, arguments, check_reopened)
     assert formal.read_bytes() == before and preview.read_bytes() == preview_before
@@ -481,9 +668,9 @@ def test_dev_project_first_start_reads_stable_only_then_saves_and_reopens_previe
 def test_dev_explicit_stable_profile_still_overrides_existing_preview(monkeypatch, tmp_path, required):
     project, source = make_project(tmp_path)
     formal = project / "settings/voice.settings.json"
-    write_profile(formal, recognition_backend="sensevoice", translation_backend="m2m100", window_opacity=100)
+    saved = write_profile(formal, recognition_backend="sensevoice", translation_backend="m2m100", window_opacity=100, font_size=24)
     preview = formal.with_name("voice.preview.settings.json")
-    write_profile(preview, recognition_backend="whisper", translation_backend="hymt", window_opacity=45)
+    write_profile(preview, recognition_backend="whisper", translation_backend="hymt", window_opacity=45, font_size=36)
     formal_before, preview_before = formal.read_bytes(), preview.read_bytes()
     monkeypatch.setattr(application, "__version__", "0.5.2-dev")
     monkeypatch.setattr(application, "__file__", str(source))
@@ -492,8 +679,8 @@ def test_dev_explicit_stable_profile_still_overrides_existing_preview(monkeypatc
     def check(window):
         assert window._settings_source == str(formal.resolve())
         assert window._controller._settings_file == formal.resolve()
-        assert window.settings.recognition_backend == "sensevoice"
-        assert window.settings.translation_backend == "m2m100"
+        assert_ab_profile(window)
+        assert_personal_preferences(window, saved)
         assert window.settings.window_opacity == 100
 
     arguments = ["--settings-file", str(formal)] + (["--require-settings"] if required else [])
@@ -550,3 +737,21 @@ def test_root_launcher_uses_project_profile_and_fails_if_it_is_missing():
     assert "%LOCALAPPDATA%" not in launcher
     assert launcher.index('if not exist "%profile%"') < launcher.index('start "" "%app%"')
     assert "exit /b 1" in launcher[launcher.index('if not exist "%profile%"'):]
+
+
+def test_ab_runtime_reports_lazy_export_failure_without_loading_weights(monkeypatch, tmp_path):
+    class MissingLazyClass:
+        __version__ = "fixture"
+        def __getattr__(self, name):
+            raise ImportError("missing lazy model dependency")
+    monkeypatch.setattr(application.importlib, "import_module", lambda name: MissingLazyClass())
+    monkeypatch.setattr(application, "_legacy_modules", lambda: [])
+    monkeypatch.setattr(audio_runtime, "_LocalEngine", forbidden)
+    report = tmp_path / "lazy-runtime-error.json"
+    assert application.check_runtime(report, ab_engines=True) == 2
+    value = json.loads(report.read_text(encoding="utf-8"))
+    assert value["modules"]["transformers"]["available"] is True
+    for name in ("transformers.AutoProcessor", "transformers.AutoModelForMultimodalLM", "funasr.AutoModel"):
+        assert value["modules"][name]["available"] is False
+        assert "missing lazy model dependency" in value["modules"][name]["error"]
+    assert value["audio_capture"] is value["models_loaded"] is value["settings_written"] is False

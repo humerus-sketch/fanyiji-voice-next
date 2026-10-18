@@ -23,6 +23,12 @@ DIRECTIONS = (("zh_to_ja", "中文 → 日文"), ("ja_to_zh", "日文 → 中文
 ZONE = timezone(timedelta(hours=8))
 
 
+def direction_choices(settings):
+    if settings.recognition_backend in {"qwen3_asr", "fun_asr"}:
+        return (("zh_to_ja", "自动识别 → 日文"), ("ja_to_zh", "自动识别 → 中文"))
+    return DIRECTIONS
+
+
 def text_label(text="", name="muted", *, wrap=False):
     label = QLabel(text)
     label.setObjectName(name)
@@ -56,6 +62,7 @@ class RuntimeSettingsDialog(QDialog):
     def __init__(self, settings, devices=(), parent=None):
         super().__init__(parent)
         self._settings = settings
+        self._ab_mode = settings.recognition_backend in {"qwen3_asr", "fun_asr"}
         self._runtime_active = False
         self._runtime_state = "idle"
         self._stop_pending = False
@@ -104,7 +111,7 @@ class RuntimeSettingsDialog(QDialog):
             enabled = QCheckBox(CHANNELS[channel])
             enabled.setChecked(source.enabled)
             direction = QComboBox()
-            for value, title in DIRECTIONS:
+            for value, title in direction_choices(settings):
                 direction.addItem(title, value)
             direction.setCurrentIndex(direction.findData(source.direction))
             heading.addWidget(enabled)
@@ -125,8 +132,10 @@ class RuntimeSettingsDialog(QDialog):
                 processing = QHBoxLayout()
                 processing.addWidget(text_label("电脑声音增强"))
                 combo = QComboBox()
-                for value, title in (("raw", "原声直通"), ("gtcrn", "GTCRN 流式降噪"),
-                                     ("mdx", "MDX人声提取"), ("mdx_gtcrn", "MDX + GTCRN")):
+                modes = (("raw", "原声直通"),) if self._ab_mode else (
+                    ("raw", "原声直通"), ("gtcrn", "GTCRN 流式降噪"),
+                    ("mdx", "MDX人声提取"), ("mdx_gtcrn", "MDX + GTCRN"))
+                for value, title in modes:
                     combo.addItem(title, value)
                 # Unaccepted DSP experiments are available only to explicitly
                 # selected diagnostic profiles, never normal mode selection.
@@ -149,6 +158,16 @@ class RuntimeSettingsDialog(QDialog):
             ("translation_device", "翻译运算设备", (("cpu", "CPU"), ("cuda", "NVIDIA GPU"))),
             ("translation_compute_type", "翻译运算精度", (("int8", "INT8"), ("int8_float16", "INT8 + FP16"), ("float16", "FP16"))),
         )
+        if self._ab_mode:
+            choices = (
+                ("recognition_backend", "配套方案", (("qwen3_asr", "A · Qwen3-ASR + TranslateGemma"),
+                                                     ("fun_asr", "B · Fun-ASR-Nano + TranslateGemma"))),
+                ("recognition_device", "识别设备", (("cpu", "CPU（FP32）"), ("cuda", "NVIDIA GPU（BF16）"))),
+                ("recognition_compute_type", "识别精度", (("bfloat16", "BF16"),)),
+                ("translation_backend", "配套翻译", (("translategemma", "TranslateGemma 4B Q4_K_M"),)),
+                ("translation_device", "翻译设备", (("cpu", "CPU"), ("cuda", "NVIDIA GPU"))),
+                ("translation_compute_type", "翻译量化", (("int8", "由 Q4_K_M 模型文件固定"),)),
+            )
         for field_name, title, options in choices:
             container = QWidget()
             row = QHBoxLayout(container)
@@ -180,6 +199,11 @@ class RuntimeSettingsDialog(QDialog):
             ("mdx_model_file", "MDX 人声提取模型（电脑声音）", "选择 Kim_Vocal_2.onnx"),
             ("gtcrn_model_file", "GTCRN 降噪模型（电脑声音）", "选择 gtcrn_simple.onnx"),
         )
+        if self._ab_mode:
+            fields = (("qwen_asr_model_dir", "A 识别模型", "在模型下载中准备"),
+                      ("fun_asr_model_dir", "B 识别模型", "在模型下载中准备"),
+                      ("gemma_model_file", "共用翻译模型", "在模型下载中准备"),
+                      ("vad_model", "共用人声检测", "在模型下载中准备"))
         for field_name, label, placeholder in fields:
             group = QWidget()
             group_layout = QVBoxLayout(group)
@@ -189,9 +213,14 @@ class RuntimeSettingsDialog(QDialog):
             edit = QLineEdit(getattr(settings, field_name))
             edit.setPlaceholderText(placeholder)
             edit.setClearButtonEnabled(True)
+            if self._ab_mode:
+                edit.setReadOnly(True)
+                edit.setClearButtonEnabled(False)
             self.path_edits[field_name] = edit
             row.addWidget(edit, 1)
             browse = action("选择…")
+            if self._ab_mode:
+                browse.setVisible(False)
             self.browse_buttons[field_name] = browse
             browse.clicked.connect(lambda _checked=False, name=field_name: self._browse(name))
             row.addWidget(browse)
@@ -313,6 +342,15 @@ class RuntimeSettingsDialog(QDialog):
             self.path_edits[field_name].setText(selected)
 
     def _update_engine_fields(self):
+        if self._ab_mode:
+            first = self.engine_combos["recognition_backend"].currentData() == "qwen3_asr"
+            self.path_groups["qwen_asr_model_dir"].setVisible(first)
+            self.path_groups["fun_asr_model_dir"].setVisible(not first)
+            self.engine_rows["recognition_compute_type"].hide()
+            self.engine_rows["translation_compute_type"].hide()
+            self.processing_hint.setText("原声进入人声检测与识别。A/B 不使用旧版增强模型。")
+            self.engine_hint.setText("模型下载与校验请使用主窗口“模型下载 · A/B”。语言自动识别，方向仅指定目标语言。B未返回源语种时不强制按日语处理。")
+            return
         whisper = self.engine_combos["recognition_backend"].currentData() == "whisper"
         nllb = self.engine_combos["translation_backend"].currentData() == "nllb"
         hymt = self.engine_combos["translation_backend"].currentData() == "hymt"
@@ -367,6 +405,11 @@ class RuntimeSettingsDialog(QDialog):
                 direction=direction.currentData(), device_index=self.device_combos[channel].currentData(),
             )
         self.result_settings = replace(self._settings, **values)
+        if self._ab_mode:
+            from .settings import with_model_combination
+            pair = "A" if values["recognition_backend"] == "qwen3_asr" else "B"
+            self.result_settings = with_model_combination(self.result_settings, pair,
+                                                         Path(self._settings.external_model_root))
         super().accept()
 
 
@@ -527,7 +570,7 @@ class _ChannelPanel(QObject):
         captions = {item.id: item for item in self.window.store.items(self.channel)}
         latest = captions.get(self.latest_id)
         failed_original = latest is not None and latest.status == "failed"
-        self.direction_label.setText(dict(DIRECTIONS)[source.direction])
+        self.direction_label.setText(dict(direction_choices(settings))[source.direction])
         self.current_card.setVisible(source.enabled)
         self.history_group.setVisible(source.enabled)
         self.latest_original.setVisible(settings.show_original and not failed_original)
@@ -708,10 +751,16 @@ class StudioWindow(QMainWindow):
     playback_speed_changed = Signal(float)
     closing = Signal()
     update_requested = Signal()
+    models_requested = Signal()
 
     def __init__(self, settings=None, *, prototype=True):
         super().__init__()
         self.prototype = bool(prototype)
+        if settings is None and not self.prototype:
+            from .release_profile import new_application_settings
+            from .settings import with_model_combination
+            from .model_paths import external_model_root
+            settings = with_model_combination(new_application_settings(), "A", external_model_root())
         self.settings = settings or AppSettings(font_size=30)
         self._devices = []
         self._runtime_dialog = None
@@ -929,6 +978,11 @@ class StudioWindow(QMainWindow):
         self.update_button.setStyleSheet("padding: 2px 10px; min-height: 22px;")
         self.update_button.clicked.connect(self.update_requested.emit)
         dock_bottom.addWidget(self.update_button)
+        self.download_models_button = action("模型下载 · A/B", name="quietButton")
+        self.download_models_button.setAccessibleName("下载与切换 A B 模型方案")
+        self.download_models_button.setVisible(not self.prototype)
+        self.download_models_button.clicked.connect(self.models_requested.emit)
+        dock_bottom.addWidget(self.download_models_button)
         dock_bottom.addWidget(text_label("空格 播放 / 暂停" if self.prototype else "空格 开始 / 停止", "footerHint"))
         dock.addLayout(dock_bottom)
         outer.addWidget(self.playback_dock)
@@ -1032,7 +1086,7 @@ class StudioWindow(QMainWindow):
             enabled = QCheckBox(CHANNELS[channel])
             enabled.toggled.connect(self._source_changed)
             direction = QComboBox()
-            for value, title in DIRECTIONS:
+            for value, title in direction_choices(self.settings):
                 direction.addItem(title, value)
             direction.currentIndexChanged.connect(self._source_changed)
             layout.addWidget(enabled)
@@ -1097,7 +1151,9 @@ class StudioWindow(QMainWindow):
                   "recognition_backend", "whisper_model_dir", "recognition_device", "recognition_compute_type",
                   "translation_backend", "nllb_model_dir", "nllb_tokenizer_dir", "translation_device",
                   "translation_compute_type", "hymt_model_file", "hymt_server_exe", "vad_model",
-                  "system_audio_processing", "mdx_model_file", "gtcrn_model_file")
+                  "system_audio_processing", "mdx_model_file", "gtcrn_model_file",
+                  "model_combination", "external_model_root", "qwen_asr_model_dir",
+                  "fun_asr_model_dir", "gemma_model_file")
         self.update_settings(replace(self.settings, **{name: getattr(selected, name) for name in fields}))
         self.settings_changed.emit(self.settings)
 
@@ -1118,7 +1174,17 @@ class StudioWindow(QMainWindow):
 
     def set_device_error(self, message):
         if self._runtime_dialog is not None:
-            self._runtime_dialog.device_hint.setText(message)
+            dialog = self._runtime_dialog
+            timer = getattr(dialog, "_device_error_timer", None)
+            if timer is None:
+                timer = dialog._device_error_timer = QTimer(dialog)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda: dialog.device_hint.clear()
+                                      if dialog.device_hint.text() == dialog._device_error_message else None)
+            if not (timer.isActive() and dialog.device_hint.text() == message):
+                dialog._device_error_message = message
+                dialog.device_hint.setText(message)
+                timer.start(3000)
         self.show_error(message)
 
     def _shortcut(self, callback):
@@ -1149,8 +1215,10 @@ class StudioWindow(QMainWindow):
         try:
             if not self.prototype:
                 processing = settings.system_audio_processing if settings.system.enabled else "raw"
-                recognition = {"sensevoice": "SenseVoice", "whisper": "Whisper large-v3"}[settings.recognition_backend]
-                translation = {"hymt": "Hy-MT2 Q8", "m2m100": "M2M100", "nllb": "NLLB 1.3B"}[settings.translation_backend]
+                recognition = {"sensevoice": "SenseVoice", "whisper": "Whisper large-v3",
+                               "qwen3_asr": "A · Qwen3-ASR 0.6B", "fun_asr": "B · Fun-ASR-Nano"}[settings.recognition_backend]
+                translation = {"hymt": "Hy-MT2 Q8", "m2m100": "M2M100", "nllb": "NLLB 1.3B",
+                               "translategemma": "TranslateGemma 4B Q4"}[settings.translation_backend]
                 enhancement = {"raw": "原声直通", "gtcrn": "GTCRN 流式降噪",
                                "gtcrn_preserve": "GTCRN 诊断 · 原声识别",
                                "mdx": "MDX 人声提取", "mdx_gtcrn": "MDX + GTCRN"}[processing]
@@ -1359,6 +1427,8 @@ class StudioWindow(QMainWindow):
         self._toast_timer.start(1600)
 
     def show_error(self, message):
+        if self.notice.text() == message and self.notice.isVisible() and self._toast_timer.isActive():
+            return
         self._toast_timer.stop()
         self._recoverable_notice_message = None
         self.notice.setText(message)
@@ -1368,15 +1438,15 @@ class StudioWindow(QMainWindow):
         self._position_notice()
         self.notice.show()
         self.notice.raise_()
+        self._toast_timer.start(3000)
 
     def show_recoverable_error(self, message):
-        # Repeated failures must not turn a two-second notice into a permanent banner.
+        # Repeated failures must not turn a three-second notice into a permanent banner.
         if (self._recoverable_notice_message == message and self.notice.isVisible()
                 and self._toast_timer.isActive()):
             return
         self.show_error(message)
         self._recoverable_notice_message = message
-        self._toast_timer.start(2000)
 
     def _position_notice(self):
         self.notice.move(max(16, (self.centralWidget().width() - self.notice.width()) // 2),

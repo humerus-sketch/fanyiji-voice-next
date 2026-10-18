@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
@@ -375,6 +375,9 @@ class VoiceWindow(QMainWindow):
         self.notice.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.notice.setMaximumHeight(78)
         self.notice.hide()
+        self._error_timer = QTimer(self)
+        self._error_timer.setSingleShot(True)
+        self._error_timer.timeout.connect(self.notice.hide)
         layout.addWidget(self.notice)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setHandleWidth(14)
@@ -499,9 +502,12 @@ class VoiceWindow(QMainWindow):
                 level.setValue(0)
 
     def show_error(self, message):
+        if self.notice.text() == message and self.notice.isVisible() and self._error_timer.isActive():
+            return
         self.notice.setText(message)
         self.notice.setToolTip(message)
         self.notice.show()
+        self._error_timer.start(3000)
 
     def apply_event(self, event: RuntimeEvent):
         if event.channel not in self.panels:
