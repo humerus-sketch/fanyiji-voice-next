@@ -37,6 +37,8 @@ LLAMA_ASSETS = (
      "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"),
 )
 OLD_CLIENT_COMMIT = "7b466fb1c396704aab5aa82ff483a78936636d9d"
+CI_PYTHON_VERSION = (3, 12, 10)
+PYTHON_MANIFEST = "https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json"
 BOOTSTRAP_FILES = {"FanyiJiVoiceNext.exe", "_updater/FanyiJiUpdate.exe", "README.md",
                    "build-info.json", "release-defaults.json", "_updater/runtime-bootstrap.json"}
 
@@ -100,8 +102,8 @@ def remove_owned(root, target):
 
 
 def prepare(root, commit, staging_tag, final_tag):
-    if os.environ.get("GITHUB_ACTIONS") != "true" or os.name != "nt" or sys.version_info[:3] != (3, 12, 13):
-        raise ValueError("Build commands require a Windows Actions runner with Python 3.12.13")
+    if os.environ.get("GITHUB_ACTIONS") != "true" or os.name != "nt" or sys.version_info[:3] != CI_PYTHON_VERSION:
+        raise ValueError("Build commands require a Windows Actions runner with Python 3.12.10")
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True) != commit:
         raise ValueError("Checkout must equal the exact requested immutable commit")
     version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
@@ -117,6 +119,8 @@ def prepare(root, commit, staging_tag, final_tag):
     value = {"schema_version": 1, "owned_root": str(root.resolve()), "run_id": os.environ["GITHUB_RUN_ID"],
              "source_commit": commit, "version": version, "staging_tag": staging_tag, "final_tag": final_tag,
              "build_id": f"voice-ab-{version}-20261019-r2", "model_weights_bundled": False,
+             "python_version": sys.version.split()[0], "python_version_manifest": PYTHON_MANIFEST,
+             "python_patch_selection": "3.12.13 has no Windows x64 Actions asset; use official 3.12.10 Windows x64",
              "public_download_or_install_verified": False}
     save(root / "state.json", value)
     # The actual runner may have more space than the documented 14 GB. Measure
@@ -334,6 +338,7 @@ def package(root):
          "public_download_or_install_verified": False})
     save(output / "runtime-assembly-report-r3.json", {"version": value["version"], "build_id": value["build_id"],
          "archive": descriptor, "source_commit": value["source_commit"], "program_files": len(rows),
+         "python_version": value["python_version"], "python_version_manifest": value["python_version_manifest"],
          "uncompressed_size": payload_size, "model_weights_bundled": False, "user_settings_bundled": False,
          "source_tests_passed": True, "frozen_checks_passed": True, "public_download_or_install_verified": False})
     notes = (f"# 翻译姬 NEXT {value['version']} — GitHub 原生构建候选\n\n"
@@ -343,7 +348,9 @@ def package(root):
              "提供国内源、失败切换重试、断点续传和 SHA256 校验。B 主权重没有同 SHA 的 ModelScope 国内副本，"
              "仍使用 HF-Mirror/Hugging Face，不能保证所有国内网络均可访问。\n\n"
              f"源提交：`{value['source_commit']}`。构建和离线冻结验证通过不代表最终公网更新下载、安装已通过；"
-             "正式发布前还需完成最终资产地址的真实更新验证。\n")
+             "正式发布前还需完成最终资产地址的真实更新验证。\n\n"
+             f"构建 Python：`{value['python_version']}`。Actions 官方 manifest 未提供 Python 3.12.13 Windows x64，"
+             f"因此使用同一 3.12 系列中提供 Windows 安装包的 3.12.10；[官方 manifest]({PYTHON_MANIFEST})。\n")
     (output / "release-notes-r3.md").write_text(notes, encoding="utf-8")
     public = [output / part["name"] for part in parts] + [output / name for name in
               ("runtime-bundle-r3.json", "full-manifest-r3.json", "runtime-assembly-report-r3.json",
@@ -361,6 +368,22 @@ def package(root):
                       "model_weights": 0, "public_network_validation": "not run"}), flush=True)
 
 
+def release_id_for_tag(tag):
+    # REST /releases/tags/{tag} omits drafts even when the caller can read the
+    # release by ID. gh release view also enumerates accessible drafts.
+    result = subprocess.run(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "databaseId"],
+                            capture_output=True, text=True, encoding="utf-8")
+    if result.returncode == 0:
+        value = json.loads(result.stdout)
+        identifier = value.get("databaseId")
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("GitHub release lookup returned an invalid database ID")
+        return identifier
+    if "release not found" in result.stderr.casefold():
+        return None
+    raise RuntimeError("Cannot confirm whether the staging release exists; release creation stopped")
+
+
 def upload_draft(root):
     root, value = state(root)
     if not value.get("packaged") or not os.environ.get("GH_TOKEN"):
@@ -372,18 +395,19 @@ def upload_draft(root):
         if path.name != row["name"] or path.stat().st_size != row["size"] or sha256(path) != row["sha256"]:
             raise ValueError("Public asset changed after packaging")
     tag = value["staging_tag"]
-    probe = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/releases/tags/{tag}"], capture_output=True, text=True)
-    if probe.returncode == 0:
+    if release_id_for_tag(tag) is not None:
         raise ValueError("Staging release already exists; no deletion, replacement, or duplicate upload attempted")
-    if "404" not in probe.stderr:
-        raise RuntimeError("Cannot prove staging tag is absent; release creation stopped")
     tag_probe = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/git/ref/tags/{tag}"], capture_output=True, text=True)
     if tag_probe.returncode == 0 or "404" not in tag_probe.stderr:
         raise ValueError("Staging Git tag exists or its absence is unconfirmed; use a fresh staging name")
     run(["gh", "release", "create", tag, "--repo", REPOSITORY, "--draft", "--prerelease", "--target", value["source_commit"],
          "--title", f"NEXT {value['version']} r3 build candidate", "--notes-file", output / "release-notes-r3.md"])
-    remote = json.loads(run(["gh", "api", f"repos/{REPOSITORY}/releases/tags/{tag}"], capture=True))
-    if remote["draft"] is not True or remote["target_commitish"] != value["source_commit"]:
+    identifier = release_id_for_tag(tag)
+    if identifier is None:
+        raise ValueError("Created staging draft could not be located; no upload attempted")
+    remote = json.loads(run(["gh", "api", f"repos/{REPOSITORY}/releases/{identifier}"], capture=True))
+    if (remote["draft"] is not True or remote["tag_name"] != tag
+            or remote["target_commitish"] != value["source_commit"]):
         raise ValueError("Independent staging release identity mismatch")
     value.update(draft_release_id=remote["id"], draft_release_url=remote["html_url"])
     save(root / "state.json", value)
@@ -411,6 +435,22 @@ def upload_draft(root):
 
 
 def self_test():
+    from unittest.mock import patch
+
+    command = ["gh", "release", "view", "v0.5.3-r3-build", "--repo", REPOSITORY, "--json", "databaseId"]
+    with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(command, 0, '{"databaseId":416604888}', "")):
+        assert release_id_for_tag("v0.5.3-r3-build") == 416604888
+    with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(command, 1, "", "release not found")):
+        assert release_id_for_tag("v0.5.3-r3-build") is None
+    for result in (subprocess.CompletedProcess(command, 1, "", "authentication failed"),
+                   subprocess.CompletedProcess(command, 0, '{"databaseId":true}', "")):
+        with patch.object(subprocess, "run", return_value=result):
+            try:
+                release_id_for_tag("v0.5.3-r3-build")
+            except (RuntimeError, ValueError):
+                pass
+            else:
+                raise AssertionError("Unknown GitHub lookup result was accepted")
     with tempfile.TemporaryDirectory(prefix="fanyiji-ci-tool-test-") as temporary:
         root = Path(temporary)
         archive = root / "synthetic.zip"

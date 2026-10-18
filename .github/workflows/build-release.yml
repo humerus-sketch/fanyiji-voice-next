@@ -48,11 +48,11 @@ jobs:
           ref: ${{ inputs.source_commit || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Install pinned Python
+      - name: Install Python 3.12.10 (last 3.12 Windows installer in Actions manifest)
         id: python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12.13'
+          python-version: '3.12.10'
           architecture: x64
       - name: Check real disk space and create this run's isolated workspace
         shell: pwsh
