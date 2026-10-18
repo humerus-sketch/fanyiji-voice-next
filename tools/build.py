@@ -179,9 +179,19 @@ def collect_llama_runtime(folder):
 
 
 def collect_licenses(folder, edition, with_ab_engines=False):
+    import re
+
     from packaging.requirements import Requirement
 
     licenses = folder / "licenses"
+    notice_name = re.compile(r"(?:LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT|AUTHORS)(?:[.-][A-Z0-9][A-Z0-9._-]*)?", re.I)
+    # These nonstandard basenames are actual notices in the pinned runtime
+    # wheels. A substring such as ModelScope's license_plate_detection is code.
+    additional_notices = {"copying_qhull.txt", "license_dop", "licenses.third-party",
+                          "licenseref-qt-commercial.txt", "thirdpartynotices.txt"}
+    code_suffixes = {".py", ".pyc", ".pyo", ".pyw", ".pyd", ".dll", ".so", ".dylib", ".exe", ".com",
+                     ".lib", ".a", ".o", ".obj", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh",
+                     ".js", ".ts", ".java", ".class", ".bat", ".cmd", ".ps1", ".sh"}
     pending = list(license_packages(edition, True) if with_ab_engines else license_packages(edition))
     seen = set()
     while pending:
@@ -198,10 +208,13 @@ def collect_licenses(folder, edition, with_ab_engines=False):
             if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
                 pending.append(requirement.name)
         for item in distribution.files or []:
-            if any(word in Path(str(item)).name.lower() for word in ("license", "copying", "notice")):
+            relative = Path(str(item))
+            if ("__pycache__" in (part.casefold() for part in relative.parts)
+                    or any(suffix.casefold() in code_suffixes for suffix in relative.suffixes)):
+                continue
+            if notice_name.fullmatch(relative.name) or relative.name.casefold() in additional_notices:
                 source = Path(distribution.locate_file(item))
                 if source.is_file():
-                    relative = Path(str(item))
                     parts = relative.parts[1:] if relative.parts and relative.parts[0].endswith(".dist-info") else relative.parts
                     if relative.is_absolute() or ".." in parts:
                         continue

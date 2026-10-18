@@ -289,6 +289,48 @@ def test_gpu_wheel_licenses_are_retained(builder, tmp_path, fake_gpu_wheels, mon
         assert (output / "licenses" / name / "nvidia" / component / "LICENSE.txt").is_file()
 
 
+def test_license_collection_keeps_standard_and_pinned_third_party_notices_only(builder, tmp_path, monkeypatch):
+    names = {"LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "AUTHORS", "license.txt", "LICENSE-MIT",
+             "COPYING.LESSER", "LICENSE.APACHE", "AUTHORS.rst", "COPYING_QHULL.txt", "LICENSE_DOP",
+             "LICENSES.third-party", "LicenseRef-Qt-Commercial.txt", "ThirdPartyNotices.txt"}
+    rejected = {"license_plate_detection_pipeline.py", "license_plate_detection_pipeline.cpython-312.pyc",
+                "get_license.txt", "LICENSE.py", "NOTICE.pyd", "COPYING.dll", "LICENSE.exe", "AUTHORS.py",
+                "COPYRIGHT.cpp", "NOTICE.dll.txt", "__pycache__/NOTICE.txt"}
+    wheel = tmp_path / "wheel"
+    files = [Path("fixture-1.dist-info/licenses") / name for name in names | rejected]
+    for relative in files:
+        source = wheel / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("public fixture: " + relative.name, encoding="utf-8")
+    distribution = SimpleNamespace(requires=[], files=files, locate_file=lambda item: wheel / item)
+    monkeypatch.setattr(builder, "license_packages", lambda edition: ("fixture",))
+    monkeypatch.setattr(builder.importlib.metadata, "distribution", lambda name: distribution)
+    output = tmp_path / "program"
+    builder.collect_licenses(output, "voice")
+    copied = {path.name for path in (output / "licenses/fixture").rglob("*") if path.is_file()}
+    assert copied == names
+    builder.assert_public_payload(output)
+
+
+def test_actual_modelscope_wheel_license_does_not_collect_license_plate_code_or_cache(builder, tmp_path, monkeypatch):
+    try:
+        installed = builder.importlib.metadata.distribution("modelscope")
+    except builder.importlib.metadata.PackageNotFoundError:
+        pytest.skip("the pinned A/B runtime is not installed")
+    if installed.version != "1.40.2":
+        pytest.skip("this regression uses the pinned ModelScope 1.40.2 wheel")
+    # Read the real wheel RECORD/files without importing ModelScope or models.
+    distribution = SimpleNamespace(requires=[], files=installed.files, locate_file=installed.locate_file)
+    monkeypatch.setattr(builder, "license_packages", lambda edition: ("modelscope",))
+    monkeypatch.setattr(builder.importlib.metadata, "distribution", lambda name: distribution)
+    output = tmp_path / "program"
+    builder.collect_licenses(output, "voice")
+    copied = list((output / "licenses/modelscope").rglob("*"))
+    assert [path.relative_to(output / "licenses/modelscope").as_posix() for path in copied if path.is_file()] == ["licenses/LICENSE"]
+    assert not any("__pycache__" in path.parts or path.suffix in {".py", ".pyc"} for path in copied)
+    builder.assert_public_payload(output)
+
+
 def test_incomplete_gpu_wheel_is_rejected_before_output_or_build_process(builder, tmp_path, fake_gpu_wheels, monkeypatch):
     root, _records = fake_gpu_wheels
     (root / "nvidia/cublas/bin/cublas64_12.dll").unlink()
