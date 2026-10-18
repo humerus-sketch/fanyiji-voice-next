@@ -38,7 +38,6 @@ jobs:
       TRANSFORMERS_OFFLINE: '1'
       HF_HUB_DISABLE_TELEMETRY: '1'
       QT_QPA_PLATFORM: offscreen
-      PYINSTALLER_CONFIG_DIR: ${{ runner.temp }}/fanyiji-pyinstaller-${{ github.run_id }}-${{ github.run_attempt }}
       CI_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
       CI_STAGING_TAG: ${{ inputs.staging_tag }}
       CI_FINAL_ASSETS_TAG: ${{ inputs.final_assets_tag }}
@@ -60,6 +59,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          $pyinstallerCache = Join-Path $env:RUNNER_TEMP "fanyiji-pyinstaller-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "PYINSTALLER_CONFIG_DIR=$pyinstallerCache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $work = Join-Path $env:RUNNER_TEMP "fanyiji-release-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           "CI_RELEASE_ROOT=$work" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           python tools/ci_release.py prepare --work-root "$work" --commit "$env:CI_SOURCE_COMMIT" --staging-tag "$env:CI_STAGING_TAG" --final-tag "$env:CI_FINAL_ASSETS_TAG"
