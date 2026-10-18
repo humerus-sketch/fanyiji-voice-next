@@ -1,0 +1,16 @@
+name: Windows build disk preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  disk:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Report available workspace storage
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root,Free,Used | ConvertTo-Json
+          Write-Output "workspace=$env:GITHUB_WORKSPACE"
+          Write-Output "temp=$env:RUNNER_TEMP"
