@@ -600,18 +600,116 @@ def test_voice_volume_and_backlog_events_update_metrics_without_creating_caption
     assert widget.queue_label.text() == "待处理 0 段"
 
 
-def test_voice_segment_failure_keeps_original_and_shows_failed_translation(studio):
-    widget, _app = studio(prototype=False)
+@pytest.mark.parametrize("show_original", [True, False])
+def test_voice_segment_failure_displays_only_original_and_keeps_failure_details(studio, show_original):
+    widget, app = studio(AppSettings(show_original=show_original), prototype=False)
     widget.set_session_state("running")
     widget.apply_event(RuntimeEvent("original", 1, "mic", "failed", text="请保留这句原文。"))
     widget.apply_event(RuntimeEvent("error", 1, "mic", "failed", message="翻译模型执行失败。", status="recoverable"))
+    settle(app)
     caption = widget.store.items("mic")[0]
     assert caption.original == "请保留这句原文。"
     assert caption.status == "failed"
+    assert caption.translated == ""
+    assert caption.error_message == "翻译模型执行失败。"
     assert widget.panels["mic"].latest_original.text() == caption.original
-    assert "失败" in widget.panels["mic"].latest_translation.text()
+    assert widget.panels["mic"].latest_original.isHidden()
+    assert widget.panels["mic"].latest_translation.text() == caption.original
+    assert widget.panels["mic"].latest_translation.toolTip() == caption.error_message
+    row = widget.panels["mic"].rows["failed"]
+    assert row.original.isHidden()
+    assert row.translated.isVisible()
+    assert row.translated.text() == caption.original
+    assert row.translated.toolTip() == caption.error_message
+    assert caption.error_message in row.toolTip()
+    assert font_size(row.translated) >= 18
     assert "翻译失败" in widget.panels["mic"].current_title.text()
     assert widget.state_chip.text() == "正在翻译"
+    widget.update_settings(replace(widget.settings, show_original=not show_original, font_size=30))
+    settle(app)
+    assert row.original.isHidden()
+    assert row.translated.isVisible() and row.translated.text() == caption.original
+    assert widget.panels["mic"].latest_original.isHidden()
+    widget.copy_latest("mic")
+    assert QApplication.clipboard().text() == caption.original
+    assert widget._toast_timer.interval() == 1600
+    assert widget.transcript().endswith("\n" + caption.original)
+    assert caption.error_message not in widget.transcript()
+    add_caption(widget, 2, "mic", original="下一句原文。", translated="次の翻訳。")
+    assert widget.panels["mic"].latest_translation.text() == "次の翻訳。"
+    assert widget.panels["mic"].latest_original.isHidden() is show_original
+
+
+@pytest.mark.parametrize("status", ["error", "failed"])
+def test_failed_translation_events_keep_only_original_on_reading_surface(studio, status):
+    widget, _app = studio(AppSettings(show_original=False), prototype=False)
+    widget.apply_event(RuntimeEvent("original", 1, "system", "failed", text="日本語の原文です。"))
+    widget.apply_event(RuntimeEvent("translation", 1, "system", "failed", text="兼容来源的失败原因。", status=status))
+    caption = widget.store.items()[0]
+    assert caption.status == "failed" and caption.translated == ""
+    assert caption.error_message == "兼容来源的失败原因。"
+    row = widget.panels["system"].rows["failed"]
+    assert row.original.isHidden()
+    assert row.translated.text() == caption.original
+    assert row.translated.toolTip() == caption.error_message
+
+
+def test_recognition_failure_without_original_does_not_create_an_orphan_caption(studio):
+    widget, _app = studio(prototype=False)
+    widget.apply_event(RuntimeEvent("error", 1, "mic", "failed-asr", status="recoverable", message="语音识别失败。"))
+    assert not widget.store.items()
+    assert not widget.panels["mic"].rows
+
+
+def test_prototype_failure_still_displays_original_with_separate_error_details(studio):
+    widget, _app = studio(AppSettings(show_original=False))
+    widget.apply_event(RuntimeEvent("original", 1, "mic", "failed", text="预览原文。"))
+    widget.apply_event(RuntimeEvent("error", 1, "mic", "failed", message="预览失败原因。", status="recoverable"))
+    panel = widget.panels["mic"]
+    assert panel.latest_original.isHidden()
+    assert panel.latest_translation.text() == "预览原文。"
+    assert panel.latest_translation.toolTip() == "预览失败原因。"
+    assert panel.rows["failed"].translated.text() == "预览原文。"
+
+
+def test_recoverable_notice_expires_after_two_seconds_without_extension_for_duplicates(studio):
+    widget, app = studio(prototype=False)
+    widget.show_recoverable_error("本句翻译未完成。")
+    settle(app)
+    assert widget.notice.isVisible()
+    assert widget._toast_timer.interval() == 2000
+    QTest.qWait(1200)
+    remaining = widget._toast_timer.remainingTime()
+    assert 0 < remaining < 1200
+    widget.show_recoverable_error("本句翻译未完成。")
+    assert widget._toast_timer.remainingTime() <= remaining + 100
+    QTest.qWait(1000)
+    assert not widget.notice.isVisible()
+    assert not widget._toast_timer.isActive()
+
+
+def test_fatal_error_replaces_transient_notice_and_remains_visible(studio):
+    widget, app = studio(prototype=False)
+    widget.show_recoverable_error("本句翻译未完成。")
+    widget.show_error("模型载入失败，请检查路径。")
+    settle(app)
+    assert not widget._toast_timer.isActive()
+    QTest.qWait(2100)
+    assert widget.notice.isVisible()
+    assert widget.notice.text() == "模型载入失败，请检查路径。"
+
+
+@pytest.mark.parametrize("state", ["loading", "stopped"])
+def test_new_or_stopped_session_clears_only_recoverable_notice(studio, state):
+    widget, _app = studio(prototype=False)
+    widget.show_recoverable_error("本句翻译未完成。")
+    widget.set_session_state(state)
+    assert not widget.notice.isVisible()
+    assert not widget._toast_timer.isActive()
+    widget.show_error("设备配置错误。")
+    widget.set_session_state(state)
+    assert widget.notice.isVisible()
+    assert widget.notice.text() == "设备配置错误。"
 
 
 def test_voice_config_scrolls_with_apply_and_cancel_outside_the_scroll_view(studio):

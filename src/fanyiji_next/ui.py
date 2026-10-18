@@ -160,18 +160,21 @@ class CaptionRow(QFrame):
 
     def update_caption(self, caption, settings):
         self.caption = caption
+        failed = caption.status == "failed"
         self.original_label.setText(caption.original)
-        self.original_label.setVisible(settings.show_original)
+        self.original_label.setVisible(settings.show_original and not failed)
         self.original_label.setFont(QFont("Microsoft YaHei UI", max(10, round(settings.font_size * .58))))
         self.original_label.setStyleSheet(f"font-size: {max(10, round(settings.font_size * .58))}pt; color: #a6b8ca;")
         self.translation_label.setFont(QFont("Microsoft YaHei UI", settings.font_size))
-        self.translation_label.setText(caption.translated or "正在翻译…")
-        self.stage_label.setText({"translating": "翻译中", "complete": "译文", "failed": "翻译未完成"}.get(caption.status, caption.status))
+        self.translation_label.setText(caption.original if failed else caption.translated or "正在翻译…")
+        self.translation_label.setToolTip(caption.error_message if failed else "")
+        self.stage_label.setText({"translating": "翻译中", "complete": "译文", "failed": "原文已保留"}.get(caption.status, caption.status))
         color = "#f1c58d" if caption.status == "failed" else "#f0f6fc"
         self.translation_label.setStyleSheet(f"font-size: {settings.font_size}pt; color: {color};")
 
     def copy_caption(self):
-        QApplication.clipboard().setText("\n".join(text for text in (self.caption.original, self.caption.translated) if text))
+        texts = (self.caption.original,) if self.caption.status == "failed" else (self.caption.original, self.caption.translated)
+        QApplication.clipboard().setText("\n".join(text for text in texts if text))
 
 
 class CaptionPanel(QFrame):
@@ -539,7 +542,9 @@ class VoiceWindow(QMainWindow):
         parts = []
         for caption in self.store.items():
             timestamp = datetime.fromtimestamp(caption.created_at, LOCAL_TIMEZONE).strftime("%H:%M:%S")
-            parts.append(f"[{timestamp}] {CHANNEL_NAMES[caption.channel]}\n{caption.original}\n{caption.translated}")
+            texts = (caption.original,) if caption.status == "failed" else (caption.original, caption.translated)
+            body = "\n".join(text for text in texts if text)
+            parts.append(f"[{timestamp}] {CHANNEL_NAMES[caption.channel]}\n{body}")
         return "\n\n".join(parts)
 
     def _export(self):

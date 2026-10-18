@@ -1,6 +1,10 @@
 # 翻译姬 · 语音版 NEXT
 
-## 0.5.0 便携版与软件内更新
+## 0.5.1 修复版与软件内更新
+
+0.5.1 修复单句翻译失败提示一直停留的问题：提示显示约 2 秒后消失，同一提示不会反复延长；该句直接以主字幕字号显示原文，复制和导出也只保留原文。设备、模型加载等需要处理的错误仍保留明确提示。此次不更换模型，不修改已有引擎、声音处理模式或用户设置。
+
+已安装 0.5.0 的用户可在软件内更新到 0.5.1，更新只包含变更的程序文件，无需重复下载相同的运行库和模型。首次安装请先下载 [0.5.0 完整模型包](https://github.com/humerus-sketch/fanyiji-voice-next/releases/tag/v0.5.0)，再通过软件内更新到 0.5.1；0.5.1 更新 ZIP 不是独立安装包。
 
 Windows x64 独立语音版，首次使用下载 Releases 中全部 `full.7z.001`、`.002` 等分卷，放在同一目录，用 7-Zip 打开 `.001` 解压；双击完整目录中的 `FanyiJiVoiceNext.exe`。必须保留 `_internal`、`_updater`、`models`、`runtime` 和许可证目录。完整包自带本地模型，不需要另行下载 Python、Whisper 或翻译模型；NVIDIA 模型模式仍需要兼容的显卡及驱动。
 
@@ -10,7 +14,7 @@ Windows x64 独立语音版，首次使用下载 Releases 中全部 `full.7z.001
 
 内置 Whisper large-v3、SenseVoice INT8、Hy-MT2-1.8B Q8_0、NLLB-200-distilled-1.3B、M2M100 418M、GTCRN、Silero VAD，以及 Hy-MT2 所需的本地 CUDA 运行库。**NLLB 为 CC-BY-NC-4.0，仅限非商业使用**；各模型原始许可证、来源与转换说明见 `licenses/model-notices`。完整包首次安装较大，后续更新不重复下载模型。
 
-本版主要新增打包、许可证与软件内更新；此前识别及翻译准确性问题仍存在，未宣称通过“不漏句、准确性不降、说完后三秒”的联合验收。下面保留现有功能和实现边界说明。
+0.5.0 已提供便携包、许可证与软件内更新；0.5.1 仅修复失败提示与原文显示。此前识别及翻译准确性问题仍存在，未宣称通过“不漏句、准确性不降、说完后三秒”的联合验收。下面保留现有功能和实现边界说明。
 
 本项目是独立 Windows 项目，保留可滚轮回看的完整会话字幕流、暖白阅读界面与本地双路语音识别、中日互译。顶部显示所选识别、翻译和声音处理模式，设置窗口显示配置路径。本项目使用独立的项目配置，避免不同启动环境选择不同 AppData 配置。可切换 GTCRN-only 流式降噪，保留 MDX 人声提取、MDX → GTCRN 降噪处理链。可分别选择 SenseVoice／Whisper large-v3 识别，以及 Hy-MT2-1.8B Q8_0／NLLB-200-distilled-1.3B／M2M100 翻译。本机使用 Whisper＋Hy-MT2 Q8 GPU；原有 NLLB／M2M100 和各自路径保留，可在停止后随时切换。程序启动后等待手动开始，不自动采音、下载模型或调用云端翻译。
 
@@ -18,7 +22,7 @@ Windows x64 独立语音版，首次使用下载 Releases 中全部 `full.7z.001
 
 ## 直接启动
 
-双击项目根目录 **`启动翻译姬.cmd`**，打开 `dist/0.5.0-voice-r2/FanyiJiVoiceNext/FanyiJiVoiceNext.exe`，显式使用项目的 `settings/voice.settings.json`，并提供本项目 `models` 目录作为默认模型位置。完整程序目录、`settings` 和 `models` 都应保留。
+双击项目根目录 **`启动翻译姬.cmd`**，打开 `dist/0.5.1-voice/FanyiJiVoiceNext/FanyiJiVoiceNext.exe`，显式使用项目的 `settings/voice.settings.json`，并提供本项目 `models` 目录作为默认模型位置。完整程序目录、`settings` 和 `models` 都应保留。
 
 1. 点击顶部 **声音与模型**，检查两路方向和本地模型位置。麦克风默认中文 → 日文，电脑声音默认日文 → 中文；只需一路时可关闭另一路。
 2. 可点击 **刷新设备列表** 后选择设备；也可以使用系统默认设备。电脑声音使用 WASAPI loopback，不需要虚拟声卡。

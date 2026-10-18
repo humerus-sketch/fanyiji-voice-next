@@ -38,6 +38,7 @@ class FakeWindow(QObject):
         self.event_threads = []
         self.states = []
         self.errors = []
+        self.recoverable_errors = []
         self.clear_count = 0
         self.devices = []
         self.device_errors = []
@@ -62,6 +63,9 @@ class FakeWindow(QObject):
 
     def show_error(self, message):
         self.errors.append(message)
+
+    def show_recoverable_error(self, message):
+        self.recoverable_errors.append(message)
 
     def clear_captions(self):
         self.clear_count += 1
@@ -274,8 +278,21 @@ def test_recoverable_segment_or_queue_errors_do_not_freeze_later_subtitles(harne
     runtime.callback(later)
     settle(qt_app)
     assert instance.controller.state == "running"
-    assert instance.window.errors[-1] == error.message
+    assert instance.window.recoverable_errors == [error.message]
+    assert not instance.window.errors
     assert instance.window.events == [error, later]
+
+
+def test_recoverable_error_keeps_compatibility_with_windows_without_transient_notice(harness, qt_app, monkeypatch):
+    monkeypatch.delattr(FakeWindow, "show_recoverable_error")
+    instance = harness()
+    runtime = start(instance)
+    error = RuntimeEvent("error", instance.controller.session_id, "mic", "failed", status="recoverable",
+                         message="当前片段处理失败")
+    runtime.callback(error)
+    settle(qt_app)
+    assert instance.window.errors == [error.message]
+    assert instance.window.events == [error]
 
 
 def test_demo_is_explicitly_simulated_and_needs_no_runtime_or_model_paths(harness, qt_app):

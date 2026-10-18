@@ -80,6 +80,43 @@ def test_font_original_visibility_copy_and_plain_text(window):
     assert QApplication.clipboard().text().endswith("<b>这是正文</b>")
 
 
+@pytest.mark.parametrize("show_original", [True, False])
+@pytest.mark.parametrize("kind,status", [("error", "recoverable"), ("translation", "failed"), ("translation", "error")])
+def test_failed_caption_displays_original_and_keeps_diagnostics_out_of_copy_and_export(window, show_original, kind, status):
+    widget, app = window
+    original = "この文は原文のまま残します。"
+    reason = "翻译模型执行失败。"
+    widget.update_settings(replace(widget.settings, show_original=show_original))
+    widget.apply_event(RuntimeEvent("original", 1, "system", "failed", text=original))
+    widget.apply_event(RuntimeEvent(kind, 1, "system", "failed", text=reason, message=reason, status=status))
+    settle(app)
+
+    row = widget.panels["system"].rows["failed"]
+    assert row.translation_label.isVisible()
+    assert row.translation_label.text() == original
+    assert not row.original_label.isVisible()
+    assert row.translation_label.toolTip() == reason
+    assert row.stage_label.text() == "原文已保留"
+    row.copy_caption()
+    assert QApplication.clipboard().text() == original
+    transcript = widget.transcript()
+    assert transcript.count(original) == 1
+    assert reason not in transcript
+    assert "正在翻译" not in transcript
+
+
+def test_failed_caption_recovery_restores_translation_and_clears_diagnostic_tooltip(window):
+    widget, app = window
+    widget.apply_event(RuntimeEvent("original", 1, "system", "recover", text="原文です。"))
+    widget.apply_event(RuntimeEvent("error", 1, "system", "recover", message="模型执行失败。"))
+    widget.apply_event(RuntimeEvent("translation", 1, "system", "recover", text="这是原文。"))
+    settle(app)
+    row = widget.panels["system"].rows["recover"]
+    assert row.translation_label.text() == "这是原文。"
+    assert row.translation_label.toolTip() == ""
+    assert row.original_label.isVisible()
+
+
 def test_history_review_is_preserved_until_follow_button_clicked(window):
     widget, app = window
     widget.update_settings(replace(widget.settings, microphone=replace(widget.settings.microphone, enabled=False)))

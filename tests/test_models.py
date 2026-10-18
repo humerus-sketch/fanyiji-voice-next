@@ -45,7 +45,28 @@ def test_failure_updates_existing_row():
     row = store.add_original("microphone", "1", "你好")
     assert store.set_translation("microphone", "1", "翻译失败", failed=True) is row
     assert row.status == "failed"
-    assert row.translated == "翻译失败"
+    assert row.original == "你好"
+    assert row.translated == ""
+    assert row.error_message == "翻译失败"
+
+
+def test_success_after_failure_replaces_diagnostic_with_translation():
+    store = CaptionStore()
+    row = store.add_original("system", "1", "やってみよう。")
+    store.set_translation("system", "1", "未通过一致性检查", failed=True)
+    assert store.set_translation("system", "1", "试试看吧。") is row
+    assert row.status == "complete"
+    assert row.translated == "试试看吧。"
+    assert row.error_message == ""
+
+
+def test_late_failure_does_not_create_caption_without_original():
+    store = CaptionStore()
+    assert store.set_translation("system", "missing", "识别失败", failed=True) is None
+    store.add_original("system", "1", "保留这句原文")
+    store.clear()
+    assert store.set_translation("system", "1", "迟到的翻译失败", failed=True) is None
+    assert store.items() == []
 
 
 def test_clear_rejects_late_translation():

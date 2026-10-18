@@ -395,14 +395,17 @@ class _HistoryRow(QFrame):
 
     def update_caption(self, caption, settings):
         self.original.setText(caption.original)
-        self.setToolTip(datetime.fromtimestamp(caption.created_at, ZONE).strftime("%H:%M:%S"))
+        failed_original = caption.status == "failed"
+        timestamp = datetime.fromtimestamp(caption.created_at, ZONE).strftime("%H:%M:%S")
+        self.setToolTip(f"{timestamp}\n{caption.error_message}" if failed_original else timestamp)
         pending = "样例准备中…" if self.prototype else "正在本地翻译…"
         cancelled = caption.status == "cancelled"
-        self.translated.setText("已停止翻译，原文已保留" if cancelled else caption.translated or pending)
-        self.translated.setToolTip(caption.translated if caption.status == "failed" else "")
-        self.original.setVisible(settings.show_original)
+        self.translated.setText(caption.original if failed_original else
+                                "已停止翻译，原文已保留" if cancelled else caption.translated or pending)
+        self.translated.setToolTip(caption.error_message if caption.status == "failed" else "")
+        self.original.setVisible(settings.show_original and not failed_original)
         font(self.original, max(9, round(settings.font_size * .34)) if self.prototype else max(11, round(settings.font_size * .42)), SECONDARY)
-        color = SECONDARY if cancelled else "#A0573F" if caption.status == "failed" else INK
+        color = SECONDARY if cancelled else INK
         font(self.translated, max(11, round(settings.font_size * .48)) if self.prototype else max(18, round(settings.font_size * .75)), color)
 
 
@@ -521,13 +524,15 @@ class _ChannelPanel(QObject):
     def update_settings(self, settings):
         anchor = self._review_anchor()
         source = settings.microphone if self.channel == "mic" else settings.system
+        captions = {item.id: item for item in self.window.store.items(self.channel)}
+        latest = captions.get(self.latest_id)
+        failed_original = latest is not None and latest.status == "failed"
         self.direction_label.setText(dict(DIRECTIONS)[source.direction])
         self.current_card.setVisible(source.enabled)
         self.history_group.setVisible(source.enabled)
-        self.latest_original.setVisible(settings.show_original)
+        self.latest_original.setVisible(settings.show_original and not failed_original)
         font(self.latest_original, max(12, round(settings.font_size * (.48 if self.window.prototype else .4))), SECONDARY)
         font(self.latest_translation, settings.font_size if self.window.prototype else max(18, round(settings.font_size * .75)))
-        captions = {item.id: item for item in self.window.store.items(self.channel)}
         for key, row in self.rows.items():
             caption = captions.get(key)
             if caption:
@@ -561,13 +566,16 @@ class _ChannelPanel(QObject):
         self.latest_original.setText(caption.original)
         pending = "正在呈现这句样例…" if self.window.prototype else "正在本地翻译…"
         cancelled = caption.status == "cancelled"
-        self.latest_translation.setText("已停止翻译，原文已保留" if cancelled else caption.translated or pending)
-        self.latest_translation.setToolTip(caption.translated if caption.status == "failed" else "")
-        color = SECONDARY if cancelled else "#A0573F" if caption.status == "failed" else INK
+        failed_original = caption.status == "failed"
+        self.latest_original.setVisible(settings.show_original and not failed_original)
+        self.latest_translation.setText(caption.original if failed_original else
+                                        "已停止翻译，原文已保留" if cancelled else caption.translated or pending)
+        self.latest_translation.setToolTip(caption.error_message if caption.status == "failed" else "")
+        color = SECONDARY if cancelled else INK
         font(self.latest_translation, settings.font_size if self.window.prototype else max(18, round(settings.font_size * .75)), color)
         title = "已停止翻译 · " if cancelled else "翻译失败 · " if caption.status == "failed" else "当前一句 · "
         self.current_title.setText(title + datetime.fromtimestamp(caption.created_at, ZONE).strftime("%H:%M"))
-        self.copy_button.setEnabled(bool(caption.translated))
+        self.copy_button.setEnabled(bool(caption.original if failed_original else caption.translated))
         if cancelled:
             self.stop_animation()
         if changed:
@@ -927,6 +935,7 @@ class StudioWindow(QMainWindow):
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self.notice.hide)
+        self._recoverable_notice_message = None
         self._shortcuts = []
         self._reading_shortcuts = []
         for key, callback in (("Space", self._main_action), ("R", self._replay_action), ("Ctrl+E", self._export)):
@@ -1190,6 +1199,10 @@ class StudioWindow(QMainWindow):
 
     def set_session_state(self, state, message=""):
         self._state = state
+        if state in {"idle", "loading", "stopped"} and self._recoverable_notice_message is not None:
+            self._toast_timer.stop()
+            self.notice.hide()
+            self._recoverable_notice_message = None
         if not self.prototype:
             if state in {"loading", "running", "stopping"}:
                 self._voice_resources_active = True
@@ -1251,7 +1264,8 @@ class StudioWindow(QMainWindow):
         if event.kind == "original":
             caption = self.store.add_original(event.channel, event.segment_id, event.text)
         elif event.kind == "translation":
-            caption = self.store.set_translation(event.channel, event.segment_id, event.text)
+            caption = self.store.set_translation(event.channel, event.segment_id, event.text,
+                                                 failed=event.status in {"error", "failed"})
         elif event.kind == "error" and event.segment_id:
             caption = self.store.set_translation(event.channel, event.segment_id, event.message or "这句翻译失败，请查看错误信息。", failed=True)
         else:
@@ -1282,12 +1296,14 @@ class StudioWindow(QMainWindow):
         if not captions:
             return
         caption = captions[-1]
-        QApplication.clipboard().setText(caption.original + "\n" + caption.translated)
+        text = caption.original if caption.status == "failed" else caption.original + "\n" + caption.translated
+        QApplication.clipboard().setText(text)
         self.show_error("已复制这句字幕。")
         self._toast_timer.start(1600)
 
     def show_error(self, message):
         self._toast_timer.stop()
+        self._recoverable_notice_message = None
         self.notice.setText(message)
         self.notice.setToolTip(message)
         self.notice.setFixedWidth(min(560, self.centralWidget().width() - 64))
@@ -1295,6 +1311,15 @@ class StudioWindow(QMainWindow):
         self._position_notice()
         self.notice.show()
         self.notice.raise_()
+
+    def show_recoverable_error(self, message):
+        # Repeated failures must not turn a two-second notice into a permanent banner.
+        if (self._recoverable_notice_message == message and self.notice.isVisible()
+                and self._toast_timer.isActive()):
+            return
+        self.show_error(message)
+        self._recoverable_notice_message = message
+        self._toast_timer.start(2000)
 
     def _position_notice(self):
         self.notice.move(max(16, (self.centralWidget().width() - self.notice.width()) // 2),
@@ -1331,10 +1356,14 @@ class StudioWindow(QMainWindow):
     def transcript(self):
         parts = []
         for item in self.store.items():
+            heading = f"[{datetime.fromtimestamp(item.created_at, ZONE):%H:%M:%S}] {CHANNELS[item.channel]}"
+            if item.status == "failed":
+                parts.append(f"{heading}\n{item.original}")
+                continue
             translated = item.translated
             if item.status == "cancelled" and not translated:
                 translated = "[已停止翻译，原文已保留]"
-            parts.append(f"[{datetime.fromtimestamp(item.created_at, ZONE):%H:%M:%S}] {CHANNELS[item.channel]}\n{item.original}\n{translated}")
+            parts.append(f"{heading}\n{item.original}\n{translated}")
         return "\n\n".join(parts)
 
     def _export(self):

@@ -116,7 +116,8 @@ class AppController(QObject):
             if self._runtime is not None:
                 if event.status == "recoverable":
                     if self._state in {"loading", "running"}:
-                        self.window.show_error(event.message or event.text or "当前片段处理失败。")
+                        show_recoverable = getattr(self.window, "show_recoverable_error", self.window.show_error)
+                        show_recoverable(event.message or event.text or "当前片段处理失败。")
                         self.window.apply_event(event)
                 else:
                     self._report_runtime_error(event.message or event.text)

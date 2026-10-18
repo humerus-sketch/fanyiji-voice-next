@@ -76,6 +76,7 @@ class Caption:
     translated: str = ""
     status: str = "translating"
     created_at: float = field(default_factory=time)
+    error_message: str = ""
 
 
 class CaptionStore:
@@ -113,7 +114,9 @@ class CaptionStore:
         if caption is None:
             # A result can arrive after clear() or eviction; never create an orphan.
             return None
-        caption.translated = text
+        # A processing error is diagnostic data, never a translated subtitle.
+        caption.translated = "" if failed else text
+        caption.error_message = text if failed else ""
         caption.status = "failed" if failed else "complete"
         return caption
 

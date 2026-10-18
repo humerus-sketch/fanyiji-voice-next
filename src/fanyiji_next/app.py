@@ -100,6 +100,8 @@ def _settle(app):
 
 def smoke_test(screenshot=None, report_path=None):
     """Exercise the live UI/controller contract with a fake capture runtime."""
+    from time import perf_counter
+
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     from .controller import AppController
@@ -148,6 +150,28 @@ def smoke_test(screenshot=None, report_path=None):
         runtimes[0].callback(RuntimeEvent("translation", controller.session_id, channel, segment_id, text=translated))
     _settle(app)
     checks["paired_captions"] = len(window.store.items()) == 4 and all(item.original and item.translated for item in window.store.items())
+    failed_channel, failed_id, failed_source, restored_translation = examples[2]
+    failure_message = "界面检查：本句翻译未完成。"
+    notice_started = perf_counter()
+    runtimes[0].callback(RuntimeEvent("error", controller.session_id, failed_channel, failed_id,
+                                    message=failure_message, status="recoverable"))
+    _settle(app)
+    failed_caption = window.store.items(failed_channel)[-1]
+    checks["failed_caption_shows_original"] = (
+        failed_caption.original == failed_source and not failed_caption.translated
+        and window.panels[failed_channel].latest_translation.text() == failed_source
+        and failure_message not in window.transcript())
+    checks["recoverable_notice_two_second_timer"] = window._toast_timer.interval() == 2000
+    notice_loop = QEventLoop()
+    window._toast_timer.timeout.connect(notice_loop.quit)
+    QTimer.singleShot(2600, notice_loop.quit)
+    notice_loop.exec()
+    window._toast_timer.timeout.disconnect(notice_loop.quit)
+    notice_elapsed_ms = round((perf_counter() - notice_started) * 1000)
+    checks["recoverable_notice_expires"] = window.notice.isHidden() and not window._toast_timer.isActive()
+    runtimes[0].callback(RuntimeEvent("translation", controller.session_id, failed_channel, failed_id,
+                                    text=restored_translation))
+    _settle(app)
     window.model_button.click()
     _settle(app)
     dialog = window._runtime_dialog
@@ -182,6 +206,7 @@ def smoke_test(screenshot=None, report_path=None):
               "ok": all(checks.values()) and not _legacy_modules(), "checks": checks,
               "audio_capture": False, "models_loaded": False, "settings_written": False,
               "legacy_modules_loaded": _legacy_modules(), "caption_count": len(window.store.items())}
+    result["recoverable_notice_elapsed_ms"] = notice_elapsed_ms
     window.close()
     window.deleteLater()
     _settle(app)
