@@ -1,9 +1,9 @@
 @echo off
 setlocal
-set "app=%~dp0dist\0.2.0-prototype\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
-if not exist "%app%" (
-  echo Prototype executable was not found. Keep the complete project folder.
+set "python=%~dp0.venv\Scripts\pythonw.exe"
+if not exist "%python%" (
+  echo Project Python environment was not found.
   pause
   exit /b 1
 )
-start "" "%app%"
+start "" "%python%" "%~dp0run_prototype.py"

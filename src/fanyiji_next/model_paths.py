@@ -15,6 +15,19 @@ def external_model_root(*, main_file: str | Path | None = None, frozen: bool | N
     return main.parent / (main.stem + MODEL_DIRECTORY_SUFFIX)
 
 
+def application_model_root(explicit_root: str | Path | None = None) -> Path:
+    """Use a caller override or a registered installation; keep EXE defaults."""
+    if explicit_root is not None:
+        return Path(explicit_root).absolute()
+    if getattr(sys, "frozen", False):
+        from .managed_installation import managed_model_root
+        executable = Path(sys.executable).absolute()
+        shared = managed_model_root(executable.parent, executable.name)
+        if shared is not None:
+            return shared
+    return external_model_root()
+
+
 def bundled_llama_server() -> Path:
     """Runtime binaries are application resources; weights are never resources."""
     source = Path(__file__).resolve().parents[2]

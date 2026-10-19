@@ -12,6 +12,9 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_input_guard import assert_build_input
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
@@ -124,6 +127,7 @@ def _program_files(folder: Path) -> list[tuple[Path, str]]:
 
 def create_update_zip(folder: Path, target: Path, version: str) -> dict:
     """Include exactly the manifested program files, leaving installed models alone."""
+    assert_build_input(folder, purpose="update program folder")
     if target.exists() or target.is_symlink():
         raise FileExistsError(f"更新包已存在：{target}")
     entries = _program_files(folder)
@@ -152,6 +156,8 @@ def package_release(*, program_folder: Path, runtime: Path, output: Path, models
     # Kept as compatibility-only arguments for old release scripts. A supplied
     # model directory is never enumerated, required, hashed or copied.
     program_folder, runtime, output = (Path(path).absolute() for path in (program_folder, runtime, output))
+    assert_build_input(program_folder, purpose="portable program folder")
+    assert_build_input(runtime, purpose="portable native runtime")
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"输出目录已存在，请指定新目录：{output}")
     for source in (program_folder, runtime, *([Path(model_notices)] if model_notices else [])):

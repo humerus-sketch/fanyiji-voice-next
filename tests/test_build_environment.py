@@ -126,7 +126,7 @@ def test_default_editions_get_separate_versioned_outputs(builder, tmp_path, monk
     builder.main(["--edition", "voice"])
     assert checks == ["prototype", "voice"]
     for edition in checks:
-        folder = tmp_path / "dist" / f"0.2.0-{edition}" / "FanyiJiVoiceNext"
+        folder = tmp_path / "dist" / ("0.2.0" if edition == "voice" else "0.2.0-prototype") / "FanyiJiVoiceNext"
         report = json.loads((folder / "build-info.json").read_text(encoding="utf-8"))
         assert report["version"] == "0.2.0" and report["edition"] == edition
         assert report["voice_backend_bundled"] == (edition == "voice")

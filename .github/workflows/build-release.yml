@@ -8,13 +8,13 @@ on:
         type: string
         default: ''
       staging_tag:
-        description: 'NEW staging draft tag; never the stable v0.5.3 tag'
+        description: 'NEW independent staging draft tag matching the source version; never the stable tag'
         type: string
-        default: 'v0.5.3-r3-build'
+        default: 'v0.5.4-build-20261019'
       final_assets_tag:
         description: 'Final asset URL tag (descriptor must match application version)'
         type: string
-        default: 'v0.5.3'
+        default: 'v0.5.4'
       upload_draft:
         description: 'Create an independent draft and upload verified public assets; never publish'
         type: boolean

@@ -130,6 +130,8 @@ def package_patch(*, program_folder: Path, baseline_folder: Path, baseline_manif
         raise ValueError("GitHub 仓库必须为 owner/repo")
     program_folder, baseline_folder, baseline_manifest, output = (
         Path(path).absolute() for path in (program_folder, baseline_folder, baseline_manifest, output))
+    release.assert_build_input(program_folder, purpose="patch program folder")
+    release.assert_build_input(baseline_folder, purpose="patch baseline program")
     for path in (program_folder, baseline_folder, baseline_manifest, output):
         _no_links(path)
     if output.exists():

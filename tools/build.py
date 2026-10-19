@@ -14,6 +14,9 @@ import tomllib
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_input_guard import assert_build_input
 VOICE_COLLECT_ALL = ("numpy", "sherpa_onnx", "ctranslate2", "sentencepiece", "pyaudiowpatch", "soxr")
 VOICE_SUBMODULES = ("faster_whisper", "tokenizers", "av", "onnxruntime", "huggingface_hub", "tqdm")
 VOICE_BINARIES = ("tokenizers", "av", "onnxruntime")
@@ -94,6 +97,10 @@ def nvidia_binaries():
 
 
 def build_command(output, work, edition, with_ab_engines=False):
+    if getattr(sys, "frozen", False):
+        raise ValueError("请使用独立 Python 从项目源码构建，不能用验证 EXE 构建。")
+    assert_build_input(ROOT, purpose="source checkout")
+    assert_build_input(Path(sys.executable), purpose="build interpreter")
     if edition not in {"prototype", "voice"}:
         raise ValueError("Unknown edition: " + edition)
     if with_ab_engines and edition != "voice":
@@ -138,6 +145,8 @@ def build_command(output, work, edition, with_ab_engines=False):
 
 def build_update_helper(folder, work, environment):
     """A standalone helper can replace the main EXE after its process exits."""
+    assert_build_input(ROOT / "tools/update_helper.py", purpose="helper source")
+    assert_build_input(Path(sys.executable), purpose="helper build interpreter")
     destination = folder / "_updater"
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed",
                "--name", "FanyiJiUpdate", "--paths", str(ROOT / "src"),
@@ -156,6 +165,7 @@ def collect_llama_runtime(folder):
     from package_release import VC_RUNTIME_NAMES, regular_files, safe_update_path
 
     source_root = ROOT / "runtime" / "llama-b11696-cuda12.4"
+    assert_build_input(source_root, purpose="native runtime")
     entries = [path for path in regular_files(source_root)
                if path.suffix.casefold() == ".dll" or path.name == "llama-server.exe"
                or path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))]
@@ -313,6 +323,68 @@ def run_frozen_checks(folder, checks, edition, environment):
         raise RuntimeError("冻结检查意外保存了设置。")
 
 
+def registered_primary_for_build(edition, custom_output):
+    if edition != "voice" or custom_output or os.environ.get("GITHUB_ACTIONS") == "true":
+        return None
+    from fanyiji_next import managed_installation as managed
+    from fanyiji_next.app_update import _version_key
+    registry = ROOT / managed.REGISTRY_NAME
+    if not os.path.lexists(registry):
+        return None
+    value = managed._json(managed._read(registry))
+    _version_key(value.get("current_version"))
+    return managed.read_managed_installation(ROOT / "dist" / value["current_version"] / "FanyiJiVoiceNext")
+
+
+def primary_program_running(executables):
+    if os.name != "nt":
+        raise RuntimeError("当前平台无法核对主用进程；保留新构建但未切换主用登记。")
+    # Query executable paths only; never read or print process command lines.
+    script = ("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+              "$ErrorActionPreference='Stop';"
+              "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process "
+              "-Filter \"Name = 'FanyiJiVoiceNext.exe'\" | Select-Object -ExpandProperty ExecutablePath)")
+    powershell = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+                            capture_output=True, text=True, encoding="utf-8", check=True, timeout=15,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    paths = json.loads(result.stdout)
+    if not isinstance(paths, list) or any(not isinstance(path, str) or not path for path in paths):
+        raise RuntimeError("无法可靠核对主用进程路径；保留新构建但未切换主用登记。")
+    expected = {os.path.normcase(str(path)) for path in executables}
+    return any(os.path.normcase(str(Path(path).absolute())) in expected for path in paths)
+
+
+def activate_built_primary(registered, folder, version):
+    if registered is None:
+        return False
+    from fanyiji_next import managed_installation as managed
+    from fanyiji_next.app_update import _installation_lock
+    with _installation_lock(registered.project_root):
+        current = managed.read_managed_installation(registered.program_dir)
+        if current is None or current.registry_bytes != registered.registry_bytes:
+            raise RuntimeError("构建期间主用登记发生变化；保留新构建但未切换登记。")
+        expected = registered.project_root / "dist" / version / "FanyiJiVoiceNext"
+        if folder != expected:
+            raise RuntimeError("构建输出不是本项目对应版本目录，未切换主用登记。")
+        managed._plain(folder)
+        executable = managed._plain(folder / "FanyiJiVoiceNext.exe")
+        if not executable.is_file():
+            raise RuntimeError("新构建 EXE 不存在，未切换主用登记。")
+        build = managed._json(managed._read(folder / "build-info.json"))
+        if build.get("application") != managed.APPLICATION or build.get("version") != version or build.get("edition") != "voice":
+            raise RuntimeError("新构建版本信息不一致，未切换主用登记。")
+        if primary_program_running((current.program_dir / "FanyiJiVoiceNext.exe", executable)):
+            raise RuntimeError("主用程序或新构建仍在运行；保留新构建，关闭后再切换主用登记。")
+        # Recheck immediately before the one atomic pointer replacement.
+        if managed._read(registered.registry_path) != registered.registry_bytes:
+            raise RuntimeError("主用登记在进程检查期间发生变化，未切换登记。")
+        value = dict(registered.value, current_version=version,
+                     program_relative=f"dist/{version}/FanyiJiVoiceNext")
+        managed._write(registered.registry_path, managed._encoded(value))
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="分别构建独立原型或语音版，始终保留已有输出。")
     parser.add_argument("--edition", choices=("prototype", "voice"), default="prototype")
@@ -325,12 +397,14 @@ def main(argv=None):
     if args.with_ab_engines and args.edition != "voice":
         parser.error("只有语音版支持 A/B 模型运行库。")
     version = project_version()
-    output = (args.output or ROOT / "dist" / f"{version}-{args.edition}").resolve()
+    default_name = version if args.edition == "voice" else f"{version}-prototype"
+    output = (args.output or ROOT / "dist" / default_name).resolve()
     if output.exists() or output.is_symlink():
         parser.error("输出目录已存在。请用 --output 指定一个新的空路径，以保留已有程序。")
     entrypoint = ROOT / ("run_prototype.py" if args.edition == "prototype" else "run.py")
     if not entrypoint.is_file():
         parser.error("构建入口不存在：" + str(entrypoint))
+    registered = registered_primary_for_build(args.edition, args.output is not None)
     try:
         packages = license_packages(args.edition, True) if args.with_ab_engines else license_packages(args.edition)
         for package in packages:
@@ -340,7 +414,7 @@ def main(argv=None):
         command = build_command(output, work, args.edition, args.with_ab_engines)
     except importlib.metadata.PackageNotFoundError as exc:
         parser.error(f"构建依赖缺失：{exc.name}；请先在新项目独立环境中安装对应依赖。")
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     output.mkdir(parents=True)
     environment = build_environment()
@@ -364,9 +438,14 @@ def main(argv=None):
         "ab_engines_bundled": args.with_ab_engines, "ab_runtime_versions": ab_versions,
         "external_model_directory": "<executable-stem>_models",
         "update_helper_bundled": args.with_updater,
+        "build_source": "project_source", "build_entrypoint": entrypoint.name,
+        "build_from_validation_binary": False,
+        "build_environment": "github-actions" if os.environ.get("GITHUB_ACTIONS") == "true" else "local",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     run_frozen_checks(folder, output / "checks", args.edition, environment)
-    print(json.dumps({"portable_folder": str(folder), "edition": args.edition, "version": version}, ensure_ascii=False))
+    activated = activate_built_primary(registered, folder, version)
+    print(json.dumps({"portable_folder": str(folder), "edition": args.edition, "version": version,
+                      "primary_registration_updated": activated}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

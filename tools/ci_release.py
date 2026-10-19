@@ -101,15 +101,28 @@ def remove_owned(root, target):
     shutil.rmtree(target)
 
 
+def validate_release_tags(version, staging_tag, final_tag):
+    """Bind both tags to source metadata; staging must remain independent."""
+    number = r"(?:0|[1-9][0-9]*)"
+    if not isinstance(version, str) or not re.fullmatch(rf"{number}\.{number}\.{number}", version):
+        raise ValueError("Release source version must be a stable three-part version")
+    # Alphanumeric suffix components exclude ref/path separators, consecutive
+    # dots, trailing dots and Git's other special ref characters.
+    staging = rf"v{re.escape(version)}-(?:r[1-9][0-9]*-)?build(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
+    if (final_tag != f"v{version}" or not isinstance(staging_tag, str)
+            or not re.fullmatch(staging, staging_tag) or staging_tag == final_tag
+            or staging_tag.casefold().endswith(".lock")):
+        raise ValueError(f"Use final tag v{version} and a NEW, independent v{version}-build staging draft tag")
+
+
 def prepare(root, commit, staging_tag, final_tag):
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.name != "nt" or sys.version_info[:3] != CI_PYTHON_VERSION:
         raise ValueError("Build commands require a Windows Actions runner with Python 3.12.10")
-    if not re.fullmatch(r"[0-9a-f]{40}", commit) or run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True) != commit:
+    if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True) != commit):
         raise ValueError("Checkout must equal the exact requested immutable commit")
     version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    if (version != "0.5.3" or final_tag != f"v{version}"
-            or not re.fullmatch(rf"v{re.escape(version)}-r3-build(?:-[A-Za-z0-9.-]+)?", staging_tag)):
-        raise ValueError("Use the 0.5.3 final URL and a NEW, independent r3 staging draft tag")
+    validate_release_tags(version, staging_tag, final_tag)
     root = Path(root).absolute()
     parents = [Path(value).resolve() for key in ("RUNNER_TEMP", "TEMP") if (value := os.environ.get(key))]
     if (root.exists() or root.is_symlink() or not any(root.parent.resolve() == parent for parent in parents)

@@ -229,6 +229,8 @@ def assemble_runtime_bundle(*, source_zip: Path, source_manifest: Path, source_s
             or type(split_size) is not int or not 0 < split_size < 2 * GIB
             or not SHA.fullmatch(source_sha256) or not SHA.fullmatch(source_manifest_sha256)):
         raise ValueError("Invalid runtime bundle version, identity, hashes, or part size")
+    release.assert_build_input(source_zip, purpose="runtime assembly source archive")
+    release.assert_build_input(overlay, purpose="runtime assembly program overlay")
     for path in (source_zip, source_manifest, overlay, output_zip.parent):
         _ordinary(path)
     reserved = [output_zip, *(output_zip.parent / name for name in

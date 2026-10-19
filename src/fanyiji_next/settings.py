@@ -33,7 +33,7 @@ def selected_model_combination(settings: AppSettings) -> str:
 
 
 def with_model_combination(settings: AppSettings, combination: str, root: Path) -> AppSettings:
-    """Bind one supported pair to the current EXE's external weight directory."""
+    """Bind one supported pair to the caller's explicit external weight root."""
     from .model_catalog import MODEL_CATALOG, MODEL_COMBINATIONS
     from .model_paths import bundled_llama_server
 

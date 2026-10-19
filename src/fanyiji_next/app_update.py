@@ -6,7 +6,7 @@ exits. Transaction backups remain until the new application acknowledges startup
 from __future__ import annotations
 
 import ctypes
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from email.parser import BytesHeaderParser
 import hashlib
 from http.client import HTTPException
@@ -370,6 +370,8 @@ class UpdateClient:
         job.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         from fanyiji_next.update_cleanup import record_download_cleanup
         record_download_cleanup(job, archive, cache if _cleanup_cache_root is None else Path(_cleanup_cache_root))
+        from fanyiji_next.managed_installation import record_managed_update
+        record_managed_update(job)
         return PreparedUpdate(job, install, downloaded.info.version)
 
 
@@ -1066,11 +1068,18 @@ def _remove_new_empty_metadata(folder: Path, install: Path):
 
 def apply_update(job_path: Path, *, wait_timeout: float = 120, pid_alive=None, restart: bool = True, start=None):
     job, _ = _load_job(Path(job_path))
-    with _installation_lock(Path(job["install_dir"])):
-        return _apply_update_locked(job_path, wait_timeout=wait_timeout, pid_alive=pid_alive, restart=restart, start=start)
+    from fanyiji_next.managed_installation import load_managed_update
+    managed = load_managed_update(job_path)
+    with ExitStack() as locks:
+        if managed is not None:
+            locks.enter_context(_installation_lock(managed.registered.project_root))
+        locks.enter_context(_installation_lock(Path(job["install_dir"])))
+        return _apply_update_locked(job_path, wait_timeout=wait_timeout, pid_alive=pid_alive, restart=restart, start=start,
+                                    _managed=managed)
 
 
-def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive=None, restart: bool = True, start=None):
+def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive=None, restart: bool = True, start=None,
+                         _managed=None):
     """Apply one verified transaction. Exposed for local file-system tests only."""
     job_path = Path(job_path)
     job, rows = _load_job(job_path)
@@ -1084,6 +1093,11 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
         time.sleep(min(.2, max(0, deadline - time.monotonic())))
     # Recheck staged hashes and every existing target after the finite wait.
     job, rows = _load_job(job_path)
+    if _managed is not None:
+        from fanyiji_next.managed_installation import load_managed_update
+        _managed = load_managed_update(job_path)
+        if _managed is None:
+            raise UpdateError("主用安装切换任务已丢失；未覆盖程序")
     stage, install, backup = (Path(job[key]) for key in ("stage_dir", "install_dir", "backup_dir"))
     retired, new_metadata = _runtime_metadata_plan(stage, install, rows) if "runtime_build_id" in job else ([], [])
     if backup.exists():
@@ -1113,6 +1127,8 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
                 shutil.copy2(target, previous)
             touched.append((relative, existed))
             _atomic_copy(stage / relative, target)
+        if _managed is not None:
+            install, job = _managed.activate()
         if restart:
             command = [str(install / job["executable"]), *job["restart_args"]]
             # Only the real frozen helper can schedule cleanup. Source utilities
@@ -1125,6 +1141,8 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
                                        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
     except Exception as exc:
         rollback_errors = []
+        if _managed is not None:
+            install = _managed.current_install
         for relative, existed in reversed(touched):
             try:
                 target = _inside(install / relative, install)
@@ -1136,15 +1154,24 @@ def _apply_update_locked(job_path: Path, *, wait_timeout: float = 120, pid_alive
                 rollback_errors.append(f"{relative}: {rollback_exc}")
         for folder in new_metadata:
             try:
+                if _managed is not None and _managed.moved:
+                    folder = install / folder.relative_to(_managed.source)
                 _remove_new_empty_metadata(folder, install)
             except Exception as rollback_exc:
                 rollback_errors.append(f"{folder.name}: {rollback_exc}")
         if metadata_cleanup_started:
             for folder, previous, snapshot in metadata_backups:
                 try:
+                    if _managed is not None and _managed.moved:
+                        folder = install / folder.relative_to(_managed.source)
                     _copy_metadata_tree(previous, folder, snapshot)
                 except Exception as rollback_exc:
                     rollback_errors.append(f"{folder.name}: {rollback_exc}")
+        if _managed is not None:
+            try:
+                _managed.rollback()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"版本目录: {rollback_exc}")
         suffix = "；回滚失败：" + "; ".join(rollback_errors) if rollback_errors else "；已恢复原程序文件"
         raise UpdateError(f"安装失败：{exc}{suffix}。备份保留在 {backup}") from exc
     return backup

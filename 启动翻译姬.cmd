@@ -1,16 +1,4 @@
 @echo off
 setlocal
-set "app=%~dp0dist\0.5.2-external-models-r3\FanyiJiVoiceNext\FanyiJiVoiceNext.exe"
-set "profile=%~dp0settings\voice.settings.json"
-if not exist "%app%" (
-  echo FanyiJiVoiceNext executable was not found. Keep the complete project folder.
-  pause
-  exit /b 1
-)
-if not exist "%profile%" (
-  echo Voice settings were not found: "%profile%"
-  echo Restore settings\voice.settings.json from your backup before starting.
-  pause
-  exit /b 1
-)
-start "" "%app%" --settings-file "%profile%" --require-settings
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\launch_local.ps1"
+if errorlevel 1 pause

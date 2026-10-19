@@ -160,8 +160,7 @@ def test_normal_startup_binds_only_ab_root_and_waits_for_manual_start(monkeypatc
         assert window.settings.font_size == 30
         assert window._controller.state == "stopped"
         assert window._controller._runtime is None
-        assert_ab_profile(window)
-        assert window.settings.external_model_root != str(model_root)
+        assert_ab_profile(window, root=model_root)
         assert window._settings_source == str(target.resolve())
         assert str(target.resolve()) in window.model_button.toolTip()
         window.close()
@@ -268,7 +267,7 @@ def test_gui_migrates_legacy_engines_to_a_even_with_legacy_cli_overrides(monkeyp
         return window
     def inspect_idle(_self):
         window = windows[-1]
-        assert_ab_profile(window)
+        assert_ab_profile(window, root=tmp_path / "models")
         assert_personal_preferences(window, saved)
         assert window._settings_source == str(target.resolve())
         assert str(target.resolve()) in window.mode_label.toolTip()
@@ -387,6 +386,76 @@ def test_update_restart_preserves_explicit_profile_and_model_cli(monkeypatch, tm
     ))
 
 
+@pytest.mark.parametrize("inline", [False, True])
+def test_explicit_relative_shared_root_survives_restart_cwd_and_preserves_profile(monkeypatch, tmp_path, inline):
+    target = tmp_path / "chosen-settings.json"
+    write_profile(target, recognition_backend="fun_asr", model_combination="B")
+    before = target.read_bytes()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    option = ["--model-root=shared"] if inline else ["--model-root", "shared"]
+    command = ["--settings-file", str(target), "--require-settings", *option]
+    def check(window):
+        assert_ab_profile(window, "B", root=tmp_path / "shared")
+        expected = ["--model-root=" + str(tmp_path / "shared")] if inline else ["--model-root", str(tmp_path / "shared")]
+        assert window._update_restart_args == tuple(command[:3] + expected)
+        assert not (tmp_path / "shared").exists()
+    probe_normal_startup(monkeypatch, command, check)
+    assert target.read_bytes() == before
+
+
+def test_shared_cli_root_is_used_by_download_dialog_and_pair_switch(monkeypatch, tmp_path):
+    from PySide6.QtCore import QObject, Signal
+    from fanyiji_next import model_download_dialog
+    target = tmp_path / "chosen-settings.json"
+    write_profile(target)
+    shared = tmp_path / "one-shared-model-set"
+    before = target.read_bytes()
+    dialogs = []
+    class FakeDialog(QObject):
+        bundle_selected = Signal(str)
+        def __init__(self, root, parent, capture_active):
+            super().__init__(parent)
+            self.root = root
+            dialogs.append(self)
+        def refresh_states(self): pass
+        def show(self): pass
+        def raise_(self): pass
+        def activateWindow(self): pass
+    monkeypatch.setattr(model_download_dialog, "ModelDownloadDialog", FakeDialog)
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    def check(window):
+        assert_ab_profile(window, root=shared)
+        window.models_requested.emit()
+        assert dialogs[0].root == shared
+        # This unit exercises the location binding, not persistence of a UI edit.
+        window.settings_changed.disconnect()
+        dialogs[0].bundle_selected.emit("B")
+        assert_ab_profile(window, "B", root=shared)
+        window.models_requested.emit()
+        assert len(dialogs) == 1 and not shared.exists()
+    probe_normal_startup(monkeypatch, ["--settings-file", str(target), "--require-settings", "--model-root", str(shared)], check)
+    assert target.read_bytes() == before
+
+
+def test_invalid_managed_model_registry_does_not_silently_use_another_model_root(monkeypatch, tmp_path):
+    target = tmp_path / "chosen-settings.json"
+    write_profile(target)
+    before = target.read_bytes()
+    errors = []
+    def invalid(_explicit):
+        raise ValueError("fixture invalid managed registry")
+    monkeypatch.setattr(model_paths, "application_model_root", invalid)
+    monkeypatch.setattr(application, "_discover_project_root", lambda: None)
+    monkeypatch.setattr(application, "_startup_profile_error", lambda *args: errors.append(args) or 2)
+    monkeypatch.setattr(studio, "StudioWindow", forbidden)
+    monkeypatch.setattr(audio_runtime, "VoiceRuntime", forbidden)
+    monkeypatch.setattr(settings, "save_settings", forbidden)
+    assert application.main(["--settings-file", str(target), "--require-settings"]) == 2
+    assert "invalid managed registry" in errors[0][1]
+    assert target.read_bytes() == before
+
+
 def test_old_ui_saved_b_backend_with_stale_a_pair_is_recovered_only_in_memory(monkeypatch, tmp_path):
     target = tmp_path / "old-ui-settings.json"
     saved = write_profile(target, recognition_backend="fun_asr", model_combination="A",
@@ -447,7 +516,7 @@ def test_saved_b_is_preserved_and_rebound_to_current_exe_name_without_touching_p
     monkeypatch.setattr(application.sys, "_MEIPASS", str(extraction), raising=False)
     monkeypatch.setattr(application, "_discover_project_root", lambda: None)
     monkeypatch.chdir(cwd)
-    command = ["--settings-file", str(target), "--require-settings", "--model-root", str(tmp_path / "ignored-model-root")]
+    command = ["--settings-file", str(target), "--require-settings"]
     expected_root = portable / f"{Path(exe_name).stem}_models"
 
     def check(window):
@@ -798,14 +867,60 @@ def test_dev_default_profile_error_reports_actual_read_source_without_falling_ba
     qt_app.processEvents()
 
 
-def test_root_launcher_uses_project_profile_and_fails_if_it_is_missing():
+def test_root_launcher_uses_managed_entry_without_a_stale_version():
     launcher = (Path(__file__).resolve().parents[1] / "启动翻译姬.cmd").read_text(encoding="utf-8")
-    assert 'set "profile=%~dp0settings\\voice.settings.json"' in launcher
-    assert '--settings-file "%profile%"' in launcher
-    assert "--require-settings" in launcher
+    assert '"%~dp0tools\\launch_local.ps1"' in launcher
     assert "%LOCALAPPDATA%" not in launcher
-    assert launcher.index('if not exist "%profile%"') < launcher.index('start "" "%app%"')
-    assert "exit /b 1" in launcher[launcher.index('if not exist "%profile%"'):]
+    assert "dist\\0." not in launcher
+
+
+@pytest.mark.parametrize("problem", [None, "missing-profile", "stale-version", "escaped-model-root"])
+def test_managed_launcher_resolves_one_shared_root_and_rejects_invalid_install(tmp_path, problem):
+    import shutil
+    import subprocess
+
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell launcher requires PowerShell")
+    project = tmp_path / "project with spaces"
+    script = project / "tools" / "launch_local.ps1"
+    script.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / "tools" / script.name, script)
+    program = project / "dist" / "0.5.3" / "FanyiJiVoiceNext"
+    program.mkdir(parents=True)
+    (program / "FanyiJiVoiceNext.exe").write_bytes(b"never executed")
+    (program / "build-info.json").write_text(json.dumps({"version": "0.5.2" if problem == "stale-version" else "0.5.3"}))
+    (project / "FanyiJiVoiceNext_models").mkdir()
+    profile = project / "settings" / "voice.settings.json"
+    profile.parent.mkdir()
+    if problem != "missing-profile":
+        from fanyiji_next.models import AppSettings
+        profile.write_text(json.dumps({"schema_version": 1, **asdict(AppSettings())}))
+    state = {"schema_version": 1, "application": "fanyiji-voice-next", "role": "primary",
+             "current_version": "0.5.3", "program_relative": "dist/0.5.3/FanyiJiVoiceNext",
+             "model_relative": "../elsewhere" if problem == "escaped-model-root" else "FanyiJiVoiceNext_models"}
+    (project / "local-installation.json").write_text(json.dumps(state))
+    command = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-CheckOnly"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if problem:
+        assert result.returncode != 0
+    else:
+        assert result.returncode == 0, result.stderr
+        normal = json.loads(result.stdout)
+        qa = subprocess.run([*command, "-ModelValidation"], capture_output=True, text=True, timeout=30)
+        assert qa.returncode == 0, qa.stderr
+        isolated = json.loads(qa.stdout)
+        assert normal["model_root"] == isolated["model_root"] == str(project / "FanyiJiVoiceNext_models")
+        assert normal["executable"] == isolated["executable"] == str(program / "FanyiJiVoiceNext.exe")
+        assert normal["settings_file"] != isolated["settings_file"]
+        assert normal["process_started"] is isolated["process_started"] is False
+        assert not (project / "validation").exists()
+        prepared = subprocess.run([*command[:-1], "-ModelValidation", "-PrepareOnly"], capture_output=True, text=True, timeout=30)
+        assert prepared.returncode == 0, prepared.stderr
+        qa_profile = project / "validation" / "model-checks" / "settings.json"
+        assert not qa_profile.read_bytes().startswith(b"\xef\xbb\xbf")
+        qa_settings = settings.load_settings(qa_profile)
+        assert not qa_settings.microphone.enabled and not qa_settings.system.enabled
 
 
 def test_ab_runtime_reports_lazy_export_failure_without_loading_weights(monkeypatch, tmp_path):

@@ -158,7 +158,7 @@ class ModelDownloadDialog(QDialog):
         self.root_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         shell.addWidget(_label("固定模型目录", name="smallCaps"))
         shell.addWidget(self.root_label)
-        shell.addWidget(_label("与主程序同级，目录名为“主程序文件名_models”；前缀随主程序名称变化。", name="footerHint"))
+        shell.addWidget(_label("模型保存在上方目录；默认目录名为“主程序文件名_models”，也可由启动配置指定共享目录。", name="footerHint"))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

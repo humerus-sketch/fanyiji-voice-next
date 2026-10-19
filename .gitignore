@@ -8,6 +8,8 @@ __pycache__/
 build/
 dist/
 artifacts/
+validation/
+local-installation.json
 *.log
 models/
 runtime/

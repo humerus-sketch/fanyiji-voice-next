@@ -318,7 +318,7 @@ def main(argv=None):
     modes.add_argument("--verify-models", action="store_true", help="仅用固定官方 WAV 验证本地模型，不采音或保存设置")
     modes.add_argument("--verify-ab-audio", type=Path, help="只读取录音前8秒检查 A/B 推理；需显式配置，不采音或保存设置")
     modes.add_argument("--demo", action="store_true", help="打开保留的界面演示，不采集声音")
-    parser.add_argument("--model-root", type=Path, help="为尚未设置的模型提供本地目录，不下载或自动开始")
+    parser.add_argument("--model-root", type=Path, help="显式指定共享的 A/B 模型目录；省略时跟随主程序文件名，不下载或自动开始")
     parser.add_argument("--settings-file", type=Path, help="使用指定的新项目配置文件")
     parser.add_argument("--require-settings", action="store_true", help="配置必须存在且有效；失败时停止启动，不使用默认值")
     parser.add_argument("--screenshot", type=Path)
@@ -370,7 +370,7 @@ def main(argv=None):
     from .settings import (SettingsError, load_settings, settings_path, validate_settings,
                            selected_model_combination, with_model_combination)
     from .release_profile import new_application_settings
-    from .model_paths import external_model_root
+    from .model_paths import application_model_root
     from .studio import StudioWindow
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -415,12 +415,23 @@ def main(argv=None):
         except SettingsError as exc:
             parser.error(str(exc))
     base = project_root or (Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2])
-    # Resolve anew on every launch: renaming the EXE changes the prefix. Never
-    # reuse an old absolute model path, CWD or PyInstaller's extraction folder.
-    settings = with_model_combination(settings, selected_model_combination(settings), external_model_root())
+    # An explicit shared root takes precedence. Otherwise renaming the EXE
+    # still changes its default prefix, independently of saved stale paths.
+    try:
+        model_root = application_model_root(args.model_root)
+    except (OSError, ValueError) as exc:
+        return _startup_profile_error(target, f"共享模型目录登记无效：{exc}", args.report)
+    settings = with_model_combination(settings, selected_model_combination(settings), model_root)
     window = StudioWindow(settings, prototype=False)
     # Preserve explicit profile/model selections when the updater restarts this EXE.
-    window._update_restart_args = tuple(clean_argv)
+    restart_args = list(clean_argv)
+    if args.model_root is not None:
+        for index, value in enumerate(restart_args):
+            if value == "--model-root":
+                restart_args[index + 1] = str(model_root)
+            elif value.startswith("--model-root="):
+                restart_args[index] = "--model-root=" + str(model_root)
+    window._update_restart_args = tuple(restart_args)
     window.set_settings_source(str(target.resolve()))
     controller = AppController(window, settings_file=target)
     window._controller = controller
@@ -431,13 +442,13 @@ def main(argv=None):
     def show_models():
         dialog = getattr(window, "_model_download_dialog", None)
         if dialog is None:
-            dialog = ModelDownloadDialog(external_model_root(), parent=window,
+            dialog = ModelDownloadDialog(model_root, parent=window,
                                          capture_active=lambda: controller.state not in {"stopped", "error"})
             def apply_pair(pair):
                 if controller.state not in {"stopped", "error"} or controller._runtime_busy():
                     window.show_error("请先停止翻译，再切换 A/B 方案。")
                     return
-                selected = with_model_combination(window.settings, pair, external_model_root())
+                selected = with_model_combination(window.settings, pair, model_root)
                 window.update_settings(selected)
                 window.settings_changed.emit(selected)
             dialog.bundle_selected.connect(apply_pair)
